@@ -190,6 +190,12 @@ recordings.post('/:id/jobs', async (c) => {
   await sqs.send(new SendMessageCommand({
     QueueUrl: config.sqs.transcriptionQueueUrl,
     MessageBody: JSON.stringify(message),
+    // EventBridge Pipes (heediq-infra TranscriptionStack) routes free/paid tasks by filtering
+    // on this attribute — without it, neither pipe's filterCriteria matches and the job is
+    // never picked up.
+    MessageAttributes: {
+      tier: { DataType: 'String', StringValue: tier },
+    },
   }))
 
   return ok(c, { job: JobSchema.parse(jobItem) }, 201)
