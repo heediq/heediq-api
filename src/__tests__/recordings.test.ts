@@ -141,6 +141,26 @@ describe('POST /:id/jobs — D-060 access control', () => {
     expect(res.status).toBe(201)
   })
 
+  it('sets the tier SQS message attribute — required for the EventBridge Pipe filter to route the job', async () => {
+    mockDynamoSend
+      .mockResolvedValueOnce({ Item: { recordingId: uuid, orgId: orgId, audioS3Key: 'key' } })
+      .mockResolvedValueOnce({ Item: { orgId: orgId, plan: 'free' } })
+      .mockResolvedValueOnce({})
+    mockSqsSend.mockResolvedValueOnce({})
+
+    await makeApp().request(`/${uuid}/jobs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recordingId: uuid, model: 'small' }),
+    })
+
+    expect(mockSqsSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        MessageAttributes: { tier: { DataType: 'String', StringValue: 'free' } },
+      }),
+    )
+  })
+
   it('rejects large-v3 for free tier (D-060)', async () => {
     mockDynamoSend
       .mockResolvedValueOnce({ Item: { recordingId: uuid, orgId: orgId, audioS3Key: 'key' } })

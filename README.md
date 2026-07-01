@@ -50,6 +50,8 @@ POST   /api/v1/upload/presign            { recordingId, contentType, fileSizeByt
 
 **D-060 access control (job enqueue):** free-tier orgs may only request `model: 'small'`; `large-v3` returns 403 for free orgs.
 
+**`DELETE /api/v1/recordings/:id` is a soft-delete:** sets `status='failed'` and writes `deletedAt` — does not remove the DynamoDB item. Hard delete is not implemented at MVP.
+
 **Response envelope:** `{ ok: true, data: T }` | `{ ok: false, error: { code, message, details? } }`
 
 ## Dependencies
@@ -62,7 +64,7 @@ POST   /api/v1/upload/presign            { recordingId, contentType, fileSizeByt
 ## Testing
 
 ```bash
-pnpm run test          # 16 unit tests (auth + recordings)
+pnpm run test          # 17 unit tests (auth + recordings)
 pnpm run typecheck     # tsc --noEmit
 pnpm run test:pre-pr   # typecheck + test (run before opening a PR)
 pnpm run dev           # local dev server on :3000 (tsx watch)
@@ -72,7 +74,8 @@ Integration tests (Vitest + DynamoDB Local) — to be added once the integration
 
 ## Gotchas & Constraints
 
-- **`@heediq/shared` install:** CI uses `NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` to pull from GitHub Packages. Local dev uses `file:../heediq-shared` until the package is published — update to `^0.1.0` after PR #1 merges.
+- **`@heediq/shared` install:** CI uses `NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` to pull from GitHub Packages. Local dev requires a GitHub PAT with `read:packages` scope set as `NODE_AUTH_TOKEN` — add `//npm.pkg.github.com/:_authToken=<PAT>` to `~/.npmrc` or export the var before running `pnpm install`.
 - **JWKS caching:** `createRemoteJWKSet()` is called once at cold start; jose handles key rotation automatically.
+- **`WS_CONNECTIONS_TABLE_NAME` env var:** required by `config.ts` and injected by CDK, but the WebSocket connect/disconnect route handlers are not yet implemented in this Lambda. The table reference is pre-wired here ready for the WS handler code (D-050). Without this var the Lambda will crash at cold start.
 - **D-060:** Model access is enforced by fetching the org's `plan` field from DynamoDB on every enqueue request — not cached. Acceptable at MVP scale; add caching if DynamoDB latency becomes a concern.
 - **Recordings list pagination:** cursor is a base64url-encoded DynamoDB `LastEvaluatedKey`. Members only see their own recordings (FilterExpression); admins see all org recordings.
