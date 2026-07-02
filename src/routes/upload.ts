@@ -18,7 +18,7 @@ upload.post('/presign', async (c) => {
     return apiError(c, 'BAD_REQUEST', 'Invalid request body', parsed.error.flatten())
   }
 
-  const s3Key = `recordings/${orgId}/${parsed.data.recordingId}/audio`
+  const s3Key = `sources/${orgId}/${parsed.data.sourceId}/audio`
   const uploadUrl = await getSignedUrl(
     s3,
     new PutObjectCommand({

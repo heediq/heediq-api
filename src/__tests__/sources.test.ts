@@ -9,7 +9,7 @@ vi.mock('../config.js', () => ({
   config: {
     cognito: { userPoolId: 'eu-west-1_test', region: 'eu-west-1' },
     dynamo: {
-      recordingsTable: 'heediq-recordings',
+      sourcesTable: 'heediq-sources',
       orgsTable: 'heediq-orgs',
       usersTable: 'heediq-users',
       jobsTable: 'heediq-jobs',
@@ -37,7 +37,7 @@ vi.mock('@aws-sdk/s3-request-presigner', () => ({
   getSignedUrl: vi.fn().mockResolvedValue('https://s3.presigned.url'),
 }))
 
-import { recordingsRouter } from '../routes/recordings.js'
+import { sourcesRouter } from '../routes/sources.js'
 
 function makeApp(role: 'admin' | 'member' = 'admin') {
   const app = new Hono<AuthContext>()
@@ -48,7 +48,7 @@ function makeApp(role: 'admin' | 'member' = 'admin') {
     c.set('role', role)
     await next()
   })
-  app.route('/', recordingsRouter)
+  app.route('/', sourcesRouter)
   return app
 }
 
@@ -57,25 +57,25 @@ const uuid = '00000000-0000-0000-0000-000000000001'
 const orgId = '00000000-0000-0000-0000-000000000002'
 const userId = '00000000-0000-0000-0000-000000000003'
 
-describe('GET /recordings', () => {
+describe('GET /sources', () => {
   beforeEach(() => vi.clearAllMocks())
 
-  it('returns recording list', async () => {
+  it('returns source list', async () => {
     mockDynamoSend.mockResolvedValueOnce({
-      Items: [{ recordingId: uuid, orgId: orgId, userId: userId, title: 'T', status: 'ready', createdAt: now, updatedAt: now }],
+      Items: [{ sourceId: uuid, orgId: orgId, userId: userId, title: 'T', status: 'ready', createdAt: now, updatedAt: now }],
     })
     const res = await makeApp().request('/')
     expect(res.status).toBe(200)
-    const body = await res.json() as { ok: boolean; data: { recordings: unknown[] } }
+    const body = await res.json() as { ok: boolean; data: { sources: unknown[] } }
     expect(body.ok).toBe(true)
-    expect(body.data.recordings).toHaveLength(1)
+    expect(body.data.sources).toHaveLength(1)
   })
 })
 
-describe('POST /recordings', () => {
+describe('POST /sources', () => {
   beforeEach(() => vi.clearAllMocks())
 
-  it('creates a recording', async () => {
+  it('creates a source', async () => {
     mockDynamoSend.mockResolvedValueOnce({})
     const res = await makeApp().request('/', {
       method: 'POST',
@@ -83,8 +83,8 @@ describe('POST /recordings', () => {
       body: JSON.stringify({ title: 'Sprint planning' }),
     })
     expect(res.status).toBe(201)
-    const body = await res.json() as { ok: boolean; data: { recording: { title: string } } }
-    expect(body.data.recording.title).toBe('Sprint planning')
+    const body = await res.json() as { ok: boolean; data: { source: { title: string } } }
+    expect(body.data.source.title).toBe('Sprint planning')
   })
 
   it('rejects empty title', async () => {
@@ -100,23 +100,23 @@ describe('POST /recordings', () => {
 describe('GET /:id — org isolation', () => {
   beforeEach(() => vi.clearAllMocks())
 
-  it('returns recording for correct org', async () => {
+  it('returns source for correct org', async () => {
     mockDynamoSend.mockResolvedValueOnce({
-      Item: { recordingId: uuid, orgId: orgId, userId: userId, title: 'T', status: 'ready', createdAt: now, updatedAt: now },
+      Item: { sourceId: uuid, orgId: orgId, userId: userId, title: 'T', status: 'ready', createdAt: now, updatedAt: now },
     })
     const res = await makeApp().request(`/${uuid}`)
     expect(res.status).toBe(200)
   })
 
-  it('returns 404 when recording belongs to different org', async () => {
+  it('returns 404 when source belongs to different org', async () => {
     mockDynamoSend.mockResolvedValueOnce({
-      Item: { recordingId: uuid, orgId: '00000000-0000-0000-0000-000000000099', userId: userId, title: 'T', status: 'ready', createdAt: now, updatedAt: now },
+      Item: { sourceId: uuid, orgId: '00000000-0000-0000-0000-000000000099', userId: userId, title: 'T', status: 'ready', createdAt: now, updatedAt: now },
     })
     const res = await makeApp().request(`/${uuid}`)
     expect(res.status).toBe(404)
   })
 
-  it('returns 404 when recording does not exist', async () => {
+  it('returns 404 when source does not exist', async () => {
     mockDynamoSend.mockResolvedValueOnce({ Item: undefined })
     const res = await makeApp().request(`/${uuid}`)
     expect(res.status).toBe(404)
@@ -128,7 +128,7 @@ describe('POST /:id/jobs — D-060 access control', () => {
 
   it('allows small model for free tier', async () => {
     mockDynamoSend
-      .mockResolvedValueOnce({ Item: { recordingId: uuid, orgId: orgId, audioS3Key: 'key' } })
+      .mockResolvedValueOnce({ Item: { sourceId: uuid, orgId: orgId, audioS3Key: 'key' } })
       .mockResolvedValueOnce({ Item: { orgId: orgId, plan: 'free' } })
       .mockResolvedValueOnce({})
     mockSqsSend.mockResolvedValueOnce({})
@@ -136,14 +136,14 @@ describe('POST /:id/jobs — D-060 access control', () => {
     const res = await makeApp().request(`/${uuid}/jobs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ recordingId: uuid, model: 'small' }),
+      body: JSON.stringify({ sourceId: uuid, model: 'small' }),
     })
     expect(res.status).toBe(201)
   })
 
   it('sets the tier SQS message attribute — required for the EventBridge Pipe filter to route the job', async () => {
     mockDynamoSend
-      .mockResolvedValueOnce({ Item: { recordingId: uuid, orgId: orgId, audioS3Key: 'key' } })
+      .mockResolvedValueOnce({ Item: { sourceId: uuid, orgId: orgId, audioS3Key: 'key' } })
       .mockResolvedValueOnce({ Item: { orgId: orgId, plan: 'free' } })
       .mockResolvedValueOnce({})
     mockSqsSend.mockResolvedValueOnce({})
@@ -151,7 +151,7 @@ describe('POST /:id/jobs — D-060 access control', () => {
     await makeApp().request(`/${uuid}/jobs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ recordingId: uuid, model: 'small' }),
+      body: JSON.stringify({ sourceId: uuid, model: 'small' }),
     })
 
     expect(mockSqsSend).toHaveBeenCalledWith(
@@ -163,13 +163,13 @@ describe('POST /:id/jobs — D-060 access control', () => {
 
   it('rejects large-v3 for free tier (D-060)', async () => {
     mockDynamoSend
-      .mockResolvedValueOnce({ Item: { recordingId: uuid, orgId: orgId, audioS3Key: 'key' } })
+      .mockResolvedValueOnce({ Item: { sourceId: uuid, orgId: orgId, audioS3Key: 'key' } })
       .mockResolvedValueOnce({ Item: { orgId: orgId, plan: 'free' } })
 
     const res = await makeApp().request(`/${uuid}/jobs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ recordingId: uuid, model: 'large-v3' }),
+      body: JSON.stringify({ sourceId: uuid, model: 'large-v3' }),
     })
     expect(res.status).toBe(403)
     const body = await res.json() as { ok: boolean; error: { code: string } }
@@ -178,7 +178,7 @@ describe('POST /:id/jobs — D-060 access control', () => {
 
   it('allows large-v3 for paid tier (D-060)', async () => {
     mockDynamoSend
-      .mockResolvedValueOnce({ Item: { recordingId: uuid, orgId: orgId, audioS3Key: 'key' } })
+      .mockResolvedValueOnce({ Item: { sourceId: uuid, orgId: orgId, audioS3Key: 'key' } })
       .mockResolvedValueOnce({ Item: { orgId: orgId, plan: 'paid' } })
       .mockResolvedValueOnce({})
     mockSqsSend.mockResolvedValueOnce({})
@@ -186,33 +186,33 @@ describe('POST /:id/jobs — D-060 access control', () => {
     const res = await makeApp().request(`/${uuid}/jobs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ recordingId: uuid, model: 'large-v3' }),
+      body: JSON.stringify({ sourceId: uuid, model: 'large-v3' }),
     })
     expect(res.status).toBe(201)
   })
 
-  it('returns 404 when recording is from different org', async () => {
+  it('returns 404 when source is from different org', async () => {
     mockDynamoSend
-      .mockResolvedValueOnce({ Item: { recordingId: uuid, orgId: '00000000-0000-0000-0000-000000000099', audioS3Key: 'key' } })
+      .mockResolvedValueOnce({ Item: { sourceId: uuid, orgId: '00000000-0000-0000-0000-000000000099', audioS3Key: 'key' } })
       .mockResolvedValueOnce({ Item: { orgId: orgId, plan: 'free' } })
 
     const res = await makeApp().request(`/${uuid}/jobs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ recordingId: uuid, model: 'small' }),
+      body: JSON.stringify({ sourceId: uuid, model: 'small' }),
     })
     expect(res.status).toBe(404)
   })
 
   it('returns 400 when no audio uploaded yet', async () => {
     mockDynamoSend
-      .mockResolvedValueOnce({ Item: { recordingId: uuid, orgId: orgId } }) // no audioS3Key
+      .mockResolvedValueOnce({ Item: { sourceId: uuid, orgId: orgId } }) // no audioS3Key
       .mockResolvedValueOnce({ Item: { orgId: orgId, plan: 'free' } })
 
     const res = await makeApp().request(`/${uuid}/jobs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ recordingId: uuid, model: 'small' }),
+      body: JSON.stringify({ sourceId: uuid, model: 'small' }),
     })
     expect(res.status).toBe(400)
   })

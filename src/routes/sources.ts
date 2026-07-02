@@ -9,24 +9,24 @@ import { apiError, ok } from '../lib/errors.js'
 import { config } from '../config.js'
 import type { AuthContext } from '../middleware/auth.js'
 import {
-  RecordingSchema,
+  SourceSchema,
   JobSchema,
   SummarySchema,
-  CreateRecordingRequestSchema,
-  UpdateRecordingRequestSchema,
+  CreateSourceRequestSchema,
+  UpdateSourceRequestSchema,
   EnqueueJobRequestSchema,
   PresignUploadRequestSchema,
-  type Recording,
+  type Source,
   type TranscriptionJobMessage,
 } from '@heediq/shared'
 
 const sqs = new SQSClient({})
 const s3 = new S3Client({})
 
-const recordings = new Hono<AuthContext>()
+const sources = new Hono<AuthContext>()
 
-// GET /api/v1/recordings — list org recordings, cursor-paginated
-recordings.get('/', async (c) => {
+// GET /api/v1/sources — list org sources, cursor-paginated
+sources.get('/', async (c) => {
   const orgId = c.get('orgId')
   const userId = c.get('userId')
   const role = c.get('role')
@@ -34,7 +34,7 @@ recordings.get('/', async (c) => {
   const cursor = c.req.query('cursor')
 
   const result = await dynamo.send(new QueryCommand({
-    TableName: config.dynamo.recordingsTable,
+    TableName: config.dynamo.sourcesTable,
     IndexName: 'by-org',
     KeyConditionExpression: 'orgId = :orgId',
     ExpressionAttributeValues: {
@@ -49,68 +49,69 @@ recordings.get('/', async (c) => {
 
   const allItems = result.Items ?? []
   const hasMore = allItems.length > limit
-  const items = allItems.slice(0, limit).map((i) => RecordingSchema.parse(i))
+  const items = allItems.slice(0, limit).map((i) => SourceSchema.parse(i))
   const nextCursor = hasMore && result.LastEvaluatedKey
     ? Buffer.from(JSON.stringify(result.LastEvaluatedKey)).toString('base64url')
     : null
 
-  return ok(c, { recordings: items, nextCursor })
+  return ok(c, { sources: items, nextCursor })
 })
 
-// POST /api/v1/recordings — create recording
-recordings.post('/', async (c) => {
+// POST /api/v1/sources — create source
+sources.post('/', async (c) => {
   const orgId = c.get('orgId')
   const userId = c.get('userId')
   const body = await c.req.json()
-  const parsed = CreateRecordingRequestSchema.safeParse(body)
+  const parsed = CreateSourceRequestSchema.safeParse(body)
   if (!parsed.success) {
     return apiError(c, 'BAD_REQUEST', 'Invalid request body', parsed.error.flatten())
   }
 
   const now = new Date().toISOString()
-  const recording: Recording = {
-    recordingId: randomUUID(),
+  const source: Source = {
+    sourceId: randomUUID(),
     orgId,
     userId,
     title: parsed.data.title,
     status: 'uploading',
+    labels: [],
     ...(parsed.data.durationSecs !== undefined && { durationSecs: parsed.data.durationSecs }),
     createdAt: now,
     updatedAt: now,
   }
 
-  await dynamo.send(new PutCommand({ TableName: config.dynamo.recordingsTable, Item: recording }))
-  return ok(c, { recording }, 201)
+  await dynamo.send(new PutCommand({ TableName: config.dynamo.sourcesTable, Item: source }))
+  return ok(c, { source }, 201)
 })
 
-// GET /api/v1/recordings/:id
-recordings.get('/:id', async (c) => {
+// GET /api/v1/sources/:id
+sources.get('/:id', async (c) => {
   const orgId = c.get('orgId')
   const id = c.req.param('id')
   const res = await dynamo.send(new GetCommand({
-    TableName: config.dynamo.recordingsTable,
-    Key: { recordingId: id },
+    TableName: config.dynamo.sourcesTable,
+    Key: { sourceId: id },
   }))
   if (!res.Item || res.Item['orgId'] !== orgId) {
-    return apiError(c, 'NOT_FOUND', 'Recording not found')
+    return apiError(c, 'NOT_FOUND', 'Source not found')
   }
-  return ok(c, { recording: RecordingSchema.parse(res.Item) })
+  return ok(c, { source: SourceSchema.parse(res.Item) })
 })
 
-// PATCH /api/v1/recordings/:id
-recordings.patch('/:id', async (c) => {
+// PATCH /api/v1/sources/:id
+sources.patch('/:id', async (c) => {
   const orgId = c.get('orgId')
   const id = c.req.param('id')
   const body = await c.req.json()
-  const parsed = UpdateRecordingRequestSchema.safeParse(body)
+  const parsed = UpdateSourceRequestSchema.safeParse(body)
   if (!parsed.success) {
     return apiError(c, 'BAD_REQUEST', 'Invalid request body', parsed.error.flatten())
   }
 
   const now = new Date().toISOString()
   const res = await dynamo.send(new UpdateCommand({
-    TableName: config.dynamo.recordingsTable,
-    Key: { recordingId: id },
+    TableName: config.dynamo.sourcesTable,
+    Key: { sourceId: id },
     ConditionExpression: 'orgId = :orgId',
     UpdateExpression: 'SET #title = :title, updatedAt = :now',
     ExpressionAttributeNames: { '#title': 'title' },
@@ -118,17 +119,17 @@ recordings.patch('/:id', async (c) => {
     ReturnValues: 'ALL_NEW',
   }))
 
-  return ok(c, { recording: RecordingSchema.parse(res.Attributes) })
+  return ok(c, { source: SourceSchema.parse(res.Attributes) })
 })
 
-// DELETE /api/v1/recordings/:id — soft-delete (marks deletedAt, sets status=failed)
-recordings.delete('/:id', async (c) => {
+// DELETE /api/v1/sources/:id — soft-delete (marks deletedAt, sets status=failed)
+sources.delete('/:id', async (c) => {
   const orgId = c.get('orgId')
   const id = c.req.param('id')
   const now = new Date().toISOString()
   await dynamo.send(new UpdateCommand({
-    TableName: config.dynamo.recordingsTable,
-    Key: { recordingId: id },
+    TableName: config.dynamo.sourcesTable,
+    Key: { sourceId: id },
     ConditionExpression: 'orgId = :orgId',
     UpdateExpression: 'SET #status = :status, deletedAt = :now, updatedAt = :now',
     ExpressionAttributeNames: { '#status': 'status' },
@@ -137,8 +138,8 @@ recordings.delete('/:id', async (c) => {
   return ok(c, { deleted: true })
 })
 
-// POST /api/v1/recordings/:id/jobs — enqueue transcription job (D-060 access control)
-recordings.post('/:id/jobs', async (c) => {
+// POST /api/v1/sources/:id/jobs — enqueue transcription job (D-060 access control)
+sources.post('/:id/jobs', async (c) => {
   const orgId = c.get('orgId')
   const id = c.req.param('id')
   const body = await c.req.json()
@@ -149,15 +150,15 @@ recordings.post('/:id/jobs', async (c) => {
 
   // D-060: fetch org plan and enforce model access before enqueue
   const [recRes, orgRes] = await Promise.all([
-    dynamo.send(new GetCommand({ TableName: config.dynamo.recordingsTable, Key: { recordingId: id } })),
+    dynamo.send(new GetCommand({ TableName: config.dynamo.sourcesTable, Key: { sourceId: id } })),
     dynamo.send(new GetCommand({ TableName: config.dynamo.orgsTable, Key: { orgId } })),
   ])
 
   if (!recRes.Item || recRes.Item['orgId'] !== orgId) {
-    return apiError(c, 'NOT_FOUND', 'Recording not found')
+    return apiError(c, 'NOT_FOUND', 'Source not found')
   }
   if (!recRes.Item['audioS3Key']) {
-    return apiError(c, 'BAD_REQUEST', 'Recording has no audio uploaded yet')
+    return apiError(c, 'BAD_REQUEST', 'Source has no audio uploaded yet')
   }
 
   const tier = (orgRes.Item?.['plan'] ?? 'free') as 'free' | 'paid'
@@ -170,7 +171,7 @@ recordings.post('/:id/jobs', async (c) => {
 
   const jobItem = {
     jobId,
-    recordingId: id,
+    sourceId: id,
     orgId,
     status: 'queued' as const,
     model: parsed.data.model,
@@ -181,7 +182,7 @@ recordings.post('/:id/jobs', async (c) => {
 
   const message: TranscriptionJobMessage = {
     jobId,
-    recordingId: id,
+    sourceId: id,
     orgId,
     audioS3Key: recRes.Item['audioS3Key'] as string,
     model: parsed.data.model,
@@ -201,16 +202,16 @@ recordings.post('/:id/jobs', async (c) => {
   return ok(c, { job: JobSchema.parse(jobItem) }, 201)
 })
 
-// GET /api/v1/recordings/:id/summary
-recordings.get('/:id/summary', async (c) => {
+// GET /api/v1/sources/:id/summary
+sources.get('/:id/summary', async (c) => {
   const orgId = c.get('orgId')
   const id = c.req.param('id')
   const res = await dynamo.send(new GetCommand({
-    TableName: config.dynamo.recordingsTable,
-    Key: { recordingId: id },
+    TableName: config.dynamo.sourcesTable,
+    Key: { sourceId: id },
   }))
   if (!res.Item || res.Item['orgId'] !== orgId) {
-    return apiError(c, 'NOT_FOUND', 'Recording not found')
+    return apiError(c, 'NOT_FOUND', 'Source not found')
   }
   if (!res.Item['summary']) {
     return apiError(c, 'NOT_FOUND', 'Summary not yet available')
@@ -218,4 +219,4 @@ recordings.get('/:id/summary', async (c) => {
   return ok(c, { summary: SummarySchema.parse(res.Item['summary']) })
 })
 
-export { recordings as recordingsRouter }
+export { sources as sourcesRouter }

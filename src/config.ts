@@ -14,7 +14,7 @@ export const config = {
     region: process.env['AWS_REGION'] ?? 'eu-west-1',
   },
   dynamo: {
-    recordingsTable: requireEnv('RECORDINGS_TABLE_NAME'),
+    sourcesTable: requireEnv('SOURCES_TABLE_NAME'),
     orgsTable: requireEnv('ORGS_TABLE_NAME'),
     usersTable: requireEnv('USERS_TABLE_NAME'),
     jobsTable: requireEnv('JOBS_TABLE_NAME'),
