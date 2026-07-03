@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { authMiddleware } from './middleware/auth.js'
 import { meRouter } from './routes/me.js'
-import { recordingsRouter } from './routes/recordings.js'
+import { sourcesRouter } from './routes/sources.js'
 import { uploadRouter } from './routes/upload.js'
 import { config } from './config.js'
 import { apiError } from './lib/errors.js'
@@ -21,7 +21,7 @@ app.use('*', cors({
 const v1 = new Hono()
 v1.use('*', authMiddleware)
 v1.route('/me', meRouter)
-v1.route('/recordings', recordingsRouter)
+v1.route('/sources', sourcesRouter)
 v1.route('/upload', uploadRouter)
 
 app.route('/api/v1', v1)
