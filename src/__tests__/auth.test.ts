@@ -13,7 +13,7 @@ vi.mock('../config.js', () => ({
   config: {
     cognito: { userPoolId: 'eu-west-1_testpool', region: 'eu-west-1' },
     dynamo: {
-      recordingsTable: 'heediq-recordings',
+      sourcesTable: 'heediq-sources',
       orgsTable: 'heediq-orgs',
       usersTable: 'heediq-users',
       jobsTable: 'heediq-jobs',
