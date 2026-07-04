@@ -4,6 +4,7 @@ import { authMiddleware } from './middleware/auth.js'
 import { meRouter } from './routes/me.js'
 import { sourcesRouter } from './routes/sources.js'
 import { uploadRouter } from './routes/upload.js'
+import { authRouter } from './routes/auth.js'
 import { config } from './config.js'
 import { apiError } from './lib/errors.js'
 
@@ -16,6 +17,11 @@ app.use('*', cors({
   allowMethods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   maxAge: 86400,
 }))
+
+// Unauthenticated account-linking routes (D-078, D-079) — mounted outside the
+// authMiddleware group deliberately; a signed-in-only guard would defeat their purpose
+// (looking up an email / starting a link BEFORE a session exists).
+app.route('/api/v1/auth', authRouter)
 
 // All routes under /api/v1/ require auth (D-041, D-042)
 const v1 = new Hono()
