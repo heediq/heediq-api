@@ -8,6 +8,7 @@ on:
 # Actions variables (D-070, D-071) — not hardcoded per repo.
 env:
   FUNCTION_NAME: heediq-api
+  AUTH_PROVISION_FUNCTION_NAME: heediq-auth-provision
 
 jobs:
   build:
@@ -45,14 +46,21 @@ jobs:
       - name: Bundle
         run: pnpm run bundle
 
+      - name: Bundle auth-provision
+        run: pnpm run bundle:auth-provision
+
       - name: Zip
-        run: zip -j dist/lambda.zip dist/index.js
+        run: |
+          zip -j dist/lambda.zip dist/index.js
+          zip -j dist/auth-provision.zip dist/auth-provision.js
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: lambda-zip
-          path: dist/lambda.zip
+          path: |
+            dist/lambda.zip
+            dist/auth-provision.zip
           retention-days: 1
 
   deploy-dev:
@@ -80,6 +88,9 @@ jobs:
       - name: Deploy Lambda
         run: aws lambda update-function-code --function-name ${{ env.FUNCTION_NAME }} --zip-file fileb://lambda.zip
 
+      - name: Deploy auth-provision Lambda
+        run: aws lambda update-function-code --function-name ${{ env.AUTH_PROVISION_FUNCTION_NAME }} --zip-file fileb://auth-provision.zip
+
   deploy-staging:
     name: Deploy → staging
     needs: build
@@ -105,6 +116,9 @@ jobs:
       - name: Deploy Lambda
         run: aws lambda update-function-code --function-name ${{ env.FUNCTION_NAME }} --zip-file fileb://lambda.zip
 
+      - name: Deploy auth-provision Lambda
+        run: aws lambda update-function-code --function-name ${{ env.AUTH_PROVISION_FUNCTION_NAME }} --zip-file fileb://auth-provision.zip
+
   deploy-prod:
     name: Deploy → prod
     needs: deploy-staging
@@ -129,3 +143,6 @@ jobs:
 
       - name: Deploy Lambda
         run: aws lambda update-function-code --function-name ${{ env.FUNCTION_NAME }} --zip-file fileb://lambda.zip
+
+      - name: Deploy auth-provision Lambda
+        run: aws lambda update-function-code --function-name ${{ env.AUTH_PROVISION_FUNCTION_NAME }} --zip-file fileb://auth-provision.zip
