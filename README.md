@@ -68,6 +68,11 @@ POST   /api/v1/auth/link/confirm      { email, code, newPassword } -> { password
 
 **Response envelope:** `{ ok: true, data: T }` | `{ ok: false, error: { code, message, details? } }`
 
+**API version prefix (D-088):** `/api/v1/` is written in exactly one place — the two `app.route()`
+calls in `src/app.ts`. Route modules (`routes/*.ts`) never include the prefix themselves; they mount
+at their bare resource path (`auth.post('/lookup-email', ...)`) and `app.ts` supplies `/api/v1`. Any
+new router follows the same pattern — mount it in `app.ts`, don't hardcode the prefix inside it.
+
 ## Dependencies
 
 - Upstream: `heediq-infra` (Lambda + API Gateway + DynamoDB + S3 + SQS must exist before deploy, D-050)
@@ -79,7 +84,7 @@ POST   /api/v1/auth/link/confirm      { email, code, newPassword } -> { password
 ## Testing
 
 ```bash
-pnpm run test          # 54 unit tests (auth routes + auth triggers + sources)
+pnpm run test          # 58 unit tests (auth routes + auth triggers + sources + app routing)
 pnpm run typecheck     # tsc --noEmit
 pnpm run test:pre-pr   # typecheck + test (run before opening a PR)
 pnpm run dev           # local dev server on :3000 (tsx watch)
@@ -89,6 +94,13 @@ Integration tests (Vitest + DynamoDB Local) — to be added once the integration
 
 ## Gotchas & Constraints
 
+- **Route-prefix tests must use the real `app` (D-088):** `src/__tests__/app-routing.test.ts`
+  imports the actual `app` from `app.ts` and asserts on the full `/api/v1/...` path. The other route
+  test files (`lookup-email.test.ts`, `auth-link.test.ts`, `sources.test.ts`) mount their router at
+  bare `/` in isolation — fine for testing handler logic, but it means they'd stay green even if the
+  route were mounted at the wrong prefix in `app.ts`. That gap is exactly how a production 404
+  shipped (`heediq-web` calling `/auth/lookup-email` against a backend only serving
+  `/api/v1/auth/lookup-email`). Any new prefix-sensitive assertion belongs in `app-routing.test.ts`.
 - **`@heediq/shared` install:** CI uses `NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` to pull from GitHub Packages. Local dev requires a GitHub PAT with `read:packages` scope set as `NODE_AUTH_TOKEN` — add `//npm.pkg.github.com/:_authToken=<PAT>` to `~/.npmrc` or export the var before running `pnpm install`.
 - **JWKS caching:** `createRemoteJWKSet()` is called once at cold start; jose handles key rotation automatically.
 - **`WS_CONNECTIONS_TABLE_NAME` env var:** required by `config.ts` and injected by CDK, but the WebSocket connect/disconnect route handlers are not yet implemented in this Lambda. The table reference is pre-wired here ready for the WS handler code (D-050). Without this var the Lambda will crash at cold start.
