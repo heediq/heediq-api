@@ -17,6 +17,12 @@ All Heediq REST endpoints in a single Lambda function. Handles auth, Source CRUD
 - `src/routes/me.ts` — `GET /api/v1/me`
 - `src/routes/sources.ts` — Source CRUD + job enqueue + summary fetch (D-068)
 - `src/routes/upload.ts` — `POST /api/v1/upload/presign` (S3 presigned URL)
+- `src/routes/auth.ts` — unauthenticated `/api/v1/auth` sub-app: `lookup-email` + D-087 cross-provider linking (`link/request-otp`, `link/confirm`)
+- `src/lib/cognito.ts` — Cognito Identity Provider SDK wrapper (`SignUp`, `ConfirmSignUp`, `ResendConfirmationCode`, `AdminSetUserPassword`, `AdminLinkProviderForUser`, `AdminCreateUser`, `ListUsers`) used by `routes/auth.ts` and the trigger handlers below
+- `src/handlers/auth-provision.ts` — Cognito PreTokenGeneration trigger (D-077): idempotent get-or-create of org+user by `sub`, injects `custom:orgId`/`custom:role` claims
+- `src/handlers/auth-trigger-pre-signup.ts` — Cognito PreSignUp trigger (`PreSignUp_ExternalProvider` only): links a new federated login onto a matching native account by email
+- `src/handlers/auth-trigger-post-confirmation.ts` — Cognito PostConfirmation trigger (`PostConfirmation_ConfirmSignUp` only): records the auth method + audit event; does NOT write the main `users` row (that's `auth-provision.ts`'s job, lazily at first login)
+- `src/handlers/auth-trigger-post-authentication.ts` — Cognito PostAuthentication trigger (`PostAuthentication_Authentication` only): records the auth method for the login just completed and auto-links a federated login to an existing native account with the same email if not yet linked
 
 ## Data Flow
 
@@ -46,7 +52,13 @@ DELETE /api/v1/sources/:id
 POST   /api/v1/sources/:id/jobs       { sourceId, model: 'small'|'large-v3' }
 GET    /api/v1/sources/:id/summary
 POST   /api/v1/upload/presign         { sourceId, contentType, fileSizeBytes }
+
+POST   /api/v1/auth/lookup-email      { email } -> { exists, passwordSet }              (unauthenticated)
+POST   /api/v1/auth/link/request-otp  { email }  -> { sent: true }                       (unauthenticated, D-087)
+POST   /api/v1/auth/link/confirm      { email, code, newPassword } -> { passwordSet: true } (unauthenticated, D-087)
 ```
+
+**D-087 linking flow:** `request-otp` calls Cognito `SignUp` (creating a native `UNCONFIRMED` user so Cognito emails its own verification code) or falls back to `ResendConfirmationCode` if the native user already exists mid-flow; it always returns `{ sent: true }` regardless of outcome to avoid account-existence enumeration. `confirm` calls `ConfirmSignUp`, `AdminSetUserPassword`, then `AdminLinkProviderForUser` for every external-provider user found for that email, and records the auth method once linking succeeds.
 
 **D-060 access control (job enqueue):** free-tier orgs may only request `model: 'small'`; `large-v3` returns 403 for free orgs.
 
@@ -62,11 +74,12 @@ POST   /api/v1/upload/presign         { sourceId, contentType, fileSizeBytes }
 - Upstream: `@heediq/shared` (Zod schemas + types, D-033) — pinned to `^0.2.0` (D-068 Source rename)
 - Downstream: `heediq-worker-transcription` (reads SQS messages enqueued here), `heediq-worker-summarization` (reads SQS from text-upload path)
 - Shared surfaces: `heediq-sources`, `heediq-jobs` DynamoDB tables
+- Upstream (auth): `heediq-infra`'s `UserAuthMethodsTable`/`AuthAuditLogTable` (D-087) and the Cognito User Pool triggers wired to the 3 `auth-trigger-*.ts` handlers — see `heediq-infra/README.md`
 
 ## Testing
 
 ```bash
-pnpm run test          # 17 unit tests (auth + sources)
+pnpm run test          # 54 unit tests (auth routes + auth triggers + sources)
 pnpm run typecheck     # tsc --noEmit
 pnpm run test:pre-pr   # typecheck + test (run before opening a PR)
 pnpm run dev           # local dev server on :3000 (tsx watch)
@@ -83,3 +96,5 @@ Integration tests (Vitest + DynamoDB Local) — to be added once the integration
 - **Source list pagination:** cursor is a base64url-encoded DynamoDB `LastEvaluatedKey`. Members only see their own sources (FilterExpression); admins see all org sources.
 - **`labels: []` set explicitly on create:** the `Source` object built in `POST /sources` is written directly via `PutCommand`, bypassing `SourceSchema.parse()`, so the schema's `labels` default (`[]`) is set explicitly in code to match what a read-back `.parse()` would produce.
 - **Deploy:** CI builds via `pnpm run bundle` (esbuild) and runs `aws lambda update-function-code` per environment, gated by the D-070/D-071 org-level `vars.AWS_REGION` / `vars.DEPLOY_ROLE_ARN`. See `heediq-infra/README.md` §"Initial Setup" for CDK-bootstrap prerequisites (Lambda + API Gateway must be deployed by CDK before this repo's CI can update function code).
+- **The 3 `auth-trigger-*.ts` handlers are separate bundled Lambda entry points**, not part of the main API Lambda — each has its own `bundle:auth-trigger-*` esbuild script and its own deploy step in `deploy.yml` per environment, same pattern as `auth-provision.ts`.
+- **D-087 deliberately does not replicate emotix's `post-confirmation` behavior of upserting the main `users` row.** heediq's `auth-provision.ts` PreTokenGeneration trigger already owns lazy user provisioning at first login; `auth-trigger-post-confirmation.ts` only records the auth method + audit event.
