@@ -8,6 +8,7 @@ type ErrorCode =
   | 'NOT_FOUND'
   | 'BAD_REQUEST'
   | 'CONFLICT'
+  | 'RATE_LIMITED'
   | 'INTERNAL_ERROR'
 
 const statusForCode: Record<ErrorCode, ContentfulStatusCode> = {
@@ -16,6 +17,7 @@ const statusForCode: Record<ErrorCode, ContentfulStatusCode> = {
   NOT_FOUND: 404,
   BAD_REQUEST: 400,
   CONFLICT: 409,
+  RATE_LIMITED: 429,
   INTERNAL_ERROR: 500,
 }
 
