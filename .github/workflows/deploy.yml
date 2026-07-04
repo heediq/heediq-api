@@ -9,6 +9,9 @@ on:
 env:
   FUNCTION_NAME: heediq-api
   AUTH_PROVISION_FUNCTION_NAME: heediq-auth-provision
+  AUTH_TRIGGER_PRE_SIGNUP_FUNCTION_NAME: heediq-auth-trigger-pre-signup
+  AUTH_TRIGGER_POST_CONFIRMATION_FUNCTION_NAME: heediq-auth-trigger-post-confirmation
+  AUTH_TRIGGER_POST_AUTHENTICATION_FUNCTION_NAME: heediq-auth-trigger-post-authentication
 
 jobs:
   build:
@@ -49,10 +52,22 @@ jobs:
       - name: Bundle auth-provision
         run: pnpm run bundle:auth-provision
 
+      - name: Bundle auth-trigger-pre-signup
+        run: pnpm run bundle:auth-trigger-pre-signup
+
+      - name: Bundle auth-trigger-post-confirmation
+        run: pnpm run bundle:auth-trigger-post-confirmation
+
+      - name: Bundle auth-trigger-post-authentication
+        run: pnpm run bundle:auth-trigger-post-authentication
+
       - name: Zip
         run: |
           zip -j dist/lambda.zip dist/index.js
           zip -j dist/auth-provision.zip dist/auth-provision.js
+          zip -j dist/auth-trigger-pre-signup.zip dist/auth-trigger-pre-signup.js
+          zip -j dist/auth-trigger-post-confirmation.zip dist/auth-trigger-post-confirmation.js
+          zip -j dist/auth-trigger-post-authentication.zip dist/auth-trigger-post-authentication.js
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -61,6 +76,9 @@ jobs:
           path: |
             dist/lambda.zip
             dist/auth-provision.zip
+            dist/auth-trigger-pre-signup.zip
+            dist/auth-trigger-post-confirmation.zip
+            dist/auth-trigger-post-authentication.zip
           retention-days: 1
 
   deploy-dev:
@@ -91,6 +109,15 @@ jobs:
       - name: Deploy auth-provision Lambda
         run: aws lambda update-function-code --function-name ${{ env.AUTH_PROVISION_FUNCTION_NAME }} --zip-file fileb://auth-provision.zip
 
+      - name: Deploy auth-trigger-pre-signup Lambda
+        run: aws lambda update-function-code --function-name ${{ env.AUTH_TRIGGER_PRE_SIGNUP_FUNCTION_NAME }} --zip-file fileb://auth-trigger-pre-signup.zip
+
+      - name: Deploy auth-trigger-post-confirmation Lambda
+        run: aws lambda update-function-code --function-name ${{ env.AUTH_TRIGGER_POST_CONFIRMATION_FUNCTION_NAME }} --zip-file fileb://auth-trigger-post-confirmation.zip
+
+      - name: Deploy auth-trigger-post-authentication Lambda
+        run: aws lambda update-function-code --function-name ${{ env.AUTH_TRIGGER_POST_AUTHENTICATION_FUNCTION_NAME }} --zip-file fileb://auth-trigger-post-authentication.zip
+
   deploy-staging:
     name: Deploy → staging
     needs: build
@@ -119,6 +146,15 @@ jobs:
       - name: Deploy auth-provision Lambda
         run: aws lambda update-function-code --function-name ${{ env.AUTH_PROVISION_FUNCTION_NAME }} --zip-file fileb://auth-provision.zip
 
+      - name: Deploy auth-trigger-pre-signup Lambda
+        run: aws lambda update-function-code --function-name ${{ env.AUTH_TRIGGER_PRE_SIGNUP_FUNCTION_NAME }} --zip-file fileb://auth-trigger-pre-signup.zip
+
+      - name: Deploy auth-trigger-post-confirmation Lambda
+        run: aws lambda update-function-code --function-name ${{ env.AUTH_TRIGGER_POST_CONFIRMATION_FUNCTION_NAME }} --zip-file fileb://auth-trigger-post-confirmation.zip
+
+      - name: Deploy auth-trigger-post-authentication Lambda
+        run: aws lambda update-function-code --function-name ${{ env.AUTH_TRIGGER_POST_AUTHENTICATION_FUNCTION_NAME }} --zip-file fileb://auth-trigger-post-authentication.zip
+
   deploy-prod:
     name: Deploy → prod
     needs: deploy-staging
@@ -146,3 +182,12 @@ jobs:
 
       - name: Deploy auth-provision Lambda
         run: aws lambda update-function-code --function-name ${{ env.AUTH_PROVISION_FUNCTION_NAME }} --zip-file fileb://auth-provision.zip
+
+      - name: Deploy auth-trigger-pre-signup Lambda
+        run: aws lambda update-function-code --function-name ${{ env.AUTH_TRIGGER_PRE_SIGNUP_FUNCTION_NAME }} --zip-file fileb://auth-trigger-pre-signup.zip
+
+      - name: Deploy auth-trigger-post-confirmation Lambda
+        run: aws lambda update-function-code --function-name ${{ env.AUTH_TRIGGER_POST_CONFIRMATION_FUNCTION_NAME }} --zip-file fileb://auth-trigger-post-confirmation.zip
+
+      - name: Deploy auth-trigger-post-authentication Lambda
+        run: aws lambda update-function-code --function-name ${{ env.AUTH_TRIGGER_POST_AUTHENTICATION_FUNCTION_NAME }} --zip-file fileb://auth-trigger-post-authentication.zip

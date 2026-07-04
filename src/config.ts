@@ -11,6 +11,7 @@ function requireEnv(name: string): string {
 export const config = {
   cognito: {
     userPoolId: requireEnv('COGNITO_USER_POOL_ID'),
+    clientId: requireEnv('COGNITO_CLIENT_ID'),
     region: process.env['AWS_REGION'] ?? 'eu-west-1',
   },
   dynamo: {
@@ -19,6 +20,8 @@ export const config = {
     usersTable: requireEnv('USERS_TABLE_NAME'),
     jobsTable: requireEnv('JOBS_TABLE_NAME'),
     wsConnectionsTable: requireEnv('WS_CONNECTIONS_TABLE_NAME'),
+    userAuthMethodsTable: requireEnv('USER_AUTH_METHODS_TABLE_NAME'),
+    authAuditLogTable: requireEnv('AUTH_AUDIT_LOG_TABLE_NAME'),
   },
   s3: {
     audioBucket: requireEnv('AUDIO_BUCKET_NAME'),

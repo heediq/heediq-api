@@ -11,7 +11,10 @@
     "test:watch": "vitest",
     "test:pre-pr": "pnpm run typecheck && pnpm run test",
     "bundle": "esbuild src/lambda.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/index.js --external:@aws-sdk/*",
-    "bundle:auth-provision": "esbuild src/handlers/auth-provision.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/auth-provision.js --external:@aws-sdk/*"
+    "bundle:auth-provision": "esbuild src/handlers/auth-provision.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/auth-provision.js --external:@aws-sdk/*",
+    "bundle:auth-trigger-pre-signup": "esbuild src/handlers/auth-trigger-pre-signup.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/auth-trigger-pre-signup.js --external:@aws-sdk/*",
+    "bundle:auth-trigger-post-confirmation": "esbuild src/handlers/auth-trigger-post-confirmation.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/auth-trigger-post-confirmation.js --external:@aws-sdk/*",
+    "bundle:auth-trigger-post-authentication": "esbuild src/handlers/auth-trigger-post-authentication.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/auth-trigger-post-authentication.js --external:@aws-sdk/*"
   },
   "dependencies": {
     "@aws-sdk/client-cognito-identity-provider": "^3.1079.0",
