@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { PreTokenGenerationTriggerHandler } from 'aws-lambda'
-import { GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb'
+import { GetCommand, PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb'
 import { dynamo } from '../lib/dynamo.js'
 import type { OrgRole } from '@heediq/shared'
 
@@ -18,19 +18,14 @@ const USERS_TABLE = requireEnv('USERS_TABLE_NAME')
 export const handler: PreTokenGenerationTriggerHandler = async (event) => {
   const userId = event.request.userAttributes['sub']
   const email = event.request.userAttributes['email']?.trim().toLowerCase()
-  // Cognito serializes boolean user attributes as the strings 'true'/'false'.
-  const emailVerified = event.request.userAttributes['email_verified'] === 'true'
 
-  const existing = await dynamo.send(
-    new GetCommand({ TableName: USERS_TABLE, Key: { userId } }),
-  )
+  // Resolve the canonical row by email first, not by sub (D-090). After AdminLinkProviderForUser
+  // links a federated identity to a native user (D-089), that identity's subsequent logins present
+  // the native user's sub, not the sub that originally created this row — a sub-only lookup would
+  // miss and re-provision a duplicate org for the same email.
+  const existing = await resolveExistingUser(userId, email)
 
-  if (!existing.Item) {
-    // Email-as-identity (D-078) only holds if the email is actually verified — an unverified
-    // IdP-asserted email cannot be trusted enough to auto-provision an org/user from (D-080).
-    // Skip provisioning; claims stay unset and downstream GET /me returns unauthorized-for-org.
-    if (!emailVerified) return event
-
+  if (!existing) {
     // First login for this identity (native or federated — PreTokenGeneration fires for both,
     // unlike PostConfirmation, D-077). Provisions a brand-new org with this user as admin.
     // D-020's email-domain "request to join" flow is not yet built — every first-time user
@@ -73,8 +68,8 @@ export const handler: PreTokenGenerationTriggerHandler = async (event) => {
   event.response = {
     claimsOverrideDetails: {
       claimsToAddOrOverride: {
-        'custom:orgId': existing.Item['orgId'] as string,
-        'custom:role': existing.Item['role'] as OrgRole,
+        'custom:orgId': existing['orgId'] as string,
+        'custom:role': existing['role'] as OrgRole,
       },
     },
   }
@@ -87,4 +82,21 @@ export const handler: PreTokenGenerationTriggerHandler = async (event) => {
 // without needing to inspect Client Metadata or the trigger source.
 function isFederatedLogin(event: Parameters<PreTokenGenerationTriggerHandler>[0]): boolean {
   return event.request.userAttributes['identities'] !== undefined
+}
+
+async function resolveExistingUser(
+  userId: string,
+  email: string,
+): Promise<Record<string, unknown> | undefined> {
+  const byEmail = await dynamo.send(new QueryCommand({
+    TableName: USERS_TABLE,
+    IndexName: 'by-email',
+    KeyConditionExpression: 'email = :email',
+    ExpressionAttributeValues: { ':email': email },
+    Limit: 1,
+  }))
+  if (byEmail.Items?.[0]) return byEmail.Items[0]
+
+  const bySub = await dynamo.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId } }))
+  return bySub.Item
 }
