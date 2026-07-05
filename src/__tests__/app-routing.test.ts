@@ -72,4 +72,14 @@ describe('app routing — /api/v1 prefix contract (D-088)', () => {
     const res = await app.request('/api/v1/auth/methods')
     expect(res.status).toBe(401)
   })
+
+  it('assigns a correlation ID to every response (D-085)', async () => {
+    const res = await app.request('/api/v1/me')
+    expect(res.headers.get('X-Request-Id')).toBeTruthy()
+  })
+
+  it('echoes a caller-supplied X-Request-Id instead of generating a new one (D-085)', async () => {
+    const res = await app.request('/api/v1/me', { headers: { 'X-Request-Id': 'client-req-1' } })
+    expect(res.headers.get('X-Request-Id')).toBe('client-req-1')
+  })
 })
