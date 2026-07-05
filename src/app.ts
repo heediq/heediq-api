@@ -5,6 +5,7 @@ import { meRouter } from './routes/me.js'
 import { sourcesRouter } from './routes/sources.js'
 import { uploadRouter } from './routes/upload.js'
 import { authRouter } from './routes/auth.js'
+import { authMethodsRouter } from './routes/auth-methods.js'
 import { config } from './config.js'
 import { apiError } from './lib/errors.js'
 
@@ -29,6 +30,7 @@ v1.use('*', authMiddleware)
 v1.route('/me', meRouter)
 v1.route('/sources', sourcesRouter)
 v1.route('/upload', uploadRouter)
+v1.route('/auth/methods', authMethodsRouter)
 
 app.route('/api/v1', v1)
 
