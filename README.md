@@ -83,7 +83,7 @@ new router follows the same pattern — mount it in `app.ts`, don't hardcode the
 ## Dependencies
 
 - Upstream: `heediq-infra` (Lambda + API Gateway + DynamoDB + S3 + SQS must exist before deploy, D-050)
-- Upstream: `@heediq/shared` (Zod schemas + types, D-033) — pinned to `^0.2.0` (D-068 Source rename)
+- Upstream: `@heediq/shared` (Zod schemas + types, D-033) — pinned to `^0.4.0` (D-091 `AuthMethodSchema`/`ListAuthMethodsResponseSchema` for `GET /auth/methods`)
 - Downstream: `heediq-worker-transcription` (reads SQS messages enqueued here), `heediq-worker-summarization` (reads SQS from text-upload path)
 - Shared surfaces: `heediq-sources`, `heediq-jobs` DynamoDB tables
 - Upstream (auth): `heediq-infra`'s `UserAuthMethodsTable`/`AuthAuditLogTable` (D-087) and the Cognito User Pool triggers wired to the 3 `auth-trigger-*.ts` handlers — see `heediq-infra/README.md`
