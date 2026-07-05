@@ -67,4 +67,9 @@ describe('app routing — /api/v1 prefix contract (D-088)', () => {
     const res = await app.request('/api/v1/me')
     expect(res.status).toBe(401)
   })
+
+  it('requires auth on /api/v1/auth/methods despite sharing the /auth prefix with the unauthenticated group (D-091)', async () => {
+    const res = await app.request('/api/v1/auth/methods')
+    expect(res.status).toBe(401)
+  })
 })
