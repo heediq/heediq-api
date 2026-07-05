@@ -86,7 +86,7 @@ new router follows the same pattern — mount it in `app.ts`, don't hardcode the
 ## Dependencies
 
 - Upstream: `heediq-infra` (Lambda + API Gateway + DynamoDB + S3 + SQS must exist before deploy, D-050)
-- Upstream: `@heediq/shared` (Zod schemas + types, D-033) — pinned to `^0.5.0` (D-085 `createLogger` structured logger)
+- Upstream: `@heediq/shared` (Zod schemas + types, D-033) — pinned to `^0.6.0` (D-085/D-093 `createLogger` structured logger, mandatory per D-093)
 - Downstream: `heediq-worker-transcription` (reads SQS messages enqueued here), `heediq-worker-summarization` (reads SQS from text-upload path)
 - Shared surfaces: `heediq-sources`, `heediq-jobs` DynamoDB tables
 - Upstream (auth): `heediq-infra`'s `UserAuthMethodsTable`/`AuthAuditLogTable` (D-087) and the Cognito User Pool triggers wired to the 3 `auth-trigger-*.ts` handlers — see `heediq-infra/README.md`
@@ -94,7 +94,7 @@ new router follows the same pattern — mount it in `app.ts`, don't hardcode the
 ## Testing
 
 ```bash
-pnpm run test          # 63 unit tests (auth routes + auth methods + auth triggers + sources + app routing)
+pnpm run test          # 65 unit tests (auth routes + auth methods + auth triggers + sources + app routing)
 pnpm run typecheck     # tsc --noEmit
 pnpm run test:pre-pr   # typecheck + test (run before opening a PR)
 pnpm run dev           # local dev server on :3000 (tsx watch)
@@ -113,7 +113,7 @@ Integration tests (Vitest + DynamoDB Local) — to be added once the integration
   `/api/v1/auth/lookup-email`). Any new prefix-sensitive assertion belongs in `app-routing.test.ts`.
 - **`@heediq/shared` install:** CI uses `NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` to pull from GitHub Packages. Local dev requires a GitHub PAT with `read:packages` scope set as `NODE_AUTH_TOKEN` — add `//npm.pkg.github.com/:_authToken=<PAT>` to `~/.npmrc` or export the var before running `pnpm install`.
 - **JWKS caching:** `createRemoteJWKSet()` is called once at cold start; jose handles key rotation automatically.
-- **Structured logging (D-085):** `app.ts` and `routes/sources.ts` log via `@heediq/shared`'s `createLogger('heediq-api')` — structured JSON with `requestId` (from `request-id.ts` middleware) and `sourceId` where available. The logger's own PII denylist redacts transcript/email/token-like fields; never pass raw transcript text as log metadata. X-Ray active tracing is enabled on the Lambda (`heediq-infra` `ApiStack`, D-085) for request-level tracing alongside these logs.
+- **Structured logging (D-085/D-093):** `app.ts` and `routes/sources.ts` log via `@heediq/shared`'s `createLogger('heediq-api')` — structured JSON with `requestId` (from `request-id.ts` middleware) and `sourceId` where available. Raw `console.log`/`console.error` is disallowed (D-093) — always go through the logger. Default log level is `info` in every environment; `debug` is opt-in via the `LOG_LEVEL` env var, read at runtime with no redeploy needed. The logger's own PII denylist redacts transcript/email/token-like fields; never pass raw transcript text as log metadata. X-Ray active tracing is enabled on the Lambda (`heediq-infra` `ApiStack`, D-085) for request-level tracing alongside these logs.
 - **`WS_CONNECTIONS_TABLE_NAME` env var:** required by `config.ts` and injected by CDK, but the WebSocket connect/disconnect route handlers are not yet implemented in this Lambda. The table reference is pre-wired here ready for the WS handler code (D-050). Without this var the Lambda will crash at cold start.
 - **D-060:** Model access is enforced by fetching the org's `plan` field from DynamoDB on every enqueue request — not cached. Acceptable at MVP scale; add caching if DynamoDB latency becomes a concern.
 - **Source list pagination:** cursor is a base64url-encoded DynamoDB `LastEvaluatedKey`. Members only see their own sources (FilterExpression); admins see all org sources.
