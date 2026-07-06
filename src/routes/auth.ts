@@ -155,10 +155,12 @@ auth.post('/link/confirm', async (c) => {
     await confirmSignUp(email, code)
   } catch (err: unknown) {
     if (!isAwsError(err)) throw err
-    // Already confirmed (e.g. a retried request) — proceed, this isn't a real failure.
-    if (err.name !== 'NotAuthorizedException') {
-      return apiError(c, 'BAD_REQUEST', 'Invalid or expired verification code')
-    }
+    // Cognito's ConfirmSignUp checks the user's status before the code — any user that
+    // isn't UNCONFIRMED (an already-set-up native account, or an email alias resolving to
+    // an EXTERNAL_PROVIDER user) throws NotAuthorizedException regardless of what code was
+    // submitted. Treating that as "already confirmed, proceed" let anyone bypass the code
+    // entirely for any existing account by just knowing its email — always reject instead.
+    return apiError(c, 'BAD_REQUEST', 'Invalid or expired verification code')
   }
 
   const users = await listUsersByEmail(email)
