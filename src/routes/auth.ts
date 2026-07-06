@@ -3,7 +3,7 @@ import { QueryCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb'
 import { dynamo } from '../lib/dynamo.js'
 import { apiError, ok } from '../lib/errors.js'
 import { config } from '../config.js'
-import { LookupEmailRequestSchema, LinkStartRequestSchema, LinkConfirmRequestSchema, UserSchema } from '@heediq/shared'
+import { LookupEmailRequestSchema, LinkStartRequestSchema, LinkVerifyOtpRequestSchema, LinkConfirmRequestSchema, UserSchema } from '@heediq/shared'
 import {
   signUp,
   resendConfirmationCode,
@@ -137,19 +137,21 @@ auth.post('/link/request-otp', async (c) => {
   return ok(c, { sent: true })
 })
 
-// POST /api/v1/auth/link/confirm — unauthenticated (D-087). Verifies the Cognito code, sets
-// the real password on the native identity, and links any existing federated identities
-// (Google/Microsoft) for the same email so the user has one account reachable by all methods.
-auth.post('/link/confirm', async (c) => {
+// POST /api/v1/auth/link/verify-otp — unauthenticated (D-089). Verifies the Cognito code on
+// its own, before any password is collected — this is the two-step flow's actual step 1/2
+// backend boundary (the code screen must not advance to the password screen without this
+// round trip succeeding). The code is consumed here (Cognito's ConfirmSignUp) and is never
+// sent again to /link/confirm.
+auth.post('/link/verify-otp', async (c) => {
   const body = await c.req.json()
   if (body && typeof body.email === 'string') {
     body.email = body.email.trim().toLowerCase()
   }
-  const parsed = LinkConfirmRequestSchema.safeParse(body)
+  const parsed = LinkVerifyOtpRequestSchema.safeParse(body)
   if (!parsed.success) {
     return apiError(c, 'BAD_REQUEST', 'Invalid request body', parsed.error.flatten())
   }
-  const { email, code, newPassword } = parsed.data
+  const { email, code } = parsed.data
 
   try {
     await confirmSignUp(email, code)
@@ -162,6 +164,24 @@ auth.post('/link/confirm', async (c) => {
     // entirely for any existing account by just knowing its email — always reject instead.
     return apiError(c, 'BAD_REQUEST', 'Invalid or expired verification code')
   }
+
+  return ok(c, { verified: true })
+})
+
+// POST /api/v1/auth/link/confirm — unauthenticated (D-087/D-089). Called only after
+// /link/verify-otp has already confirmed the code — sets the real password on the native
+// identity and links any existing federated identities (Google/Microsoft) for the same email
+// so the user has one account reachable by all methods.
+auth.post('/link/confirm', async (c) => {
+  const body = await c.req.json()
+  if (body && typeof body.email === 'string') {
+    body.email = body.email.trim().toLowerCase()
+  }
+  const parsed = LinkConfirmRequestSchema.safeParse(body)
+  if (!parsed.success) {
+    return apiError(c, 'BAD_REQUEST', 'Invalid request body', parsed.error.flatten())
+  }
+  const { email, newPassword } = parsed.data
 
   const users = await listUsersByEmail(email)
   const nativeUser = users.find((u) => !isExternalProviderUser(u))
