@@ -169,7 +169,13 @@ auth.post('/link/confirm', async (c) => {
 
   try {
     await adminSetUserPassword(nativeUser.Username, newPassword)
-  } catch {
+  } catch (err: unknown) {
+    // Cognito's own InvalidPasswordException means the password itself failed the pool's
+    // policy — distinct from every other failure here, so the frontend can show a
+    // requirements-specific message instead of a generic one.
+    if (isAwsError(err) && err.name === 'InvalidPasswordException') {
+      return apiError(c, 'WEAK_PASSWORD', 'Password does not meet the requirements')
+    }
     return apiError(c, 'BAD_REQUEST', 'Failed to set password')
   }
 

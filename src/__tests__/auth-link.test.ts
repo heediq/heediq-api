@@ -177,6 +177,21 @@ describe('POST /auth/link/confirm (D-087)', () => {
     expect(res.status).toBe(400)
   })
 
+  it('returns WEAK_PASSWORD when Cognito rejects the password on policy grounds', async () => {
+    mockConfirmSignUp.mockResolvedValueOnce({})
+    mockListUsersByEmail.mockResolvedValueOnce([{ Username: 'a@b.com', UserStatus: 'CONFIRMED', sub: 'native-sub' }])
+    mockAdminSetUserPassword.mockRejectedValueOnce(awsError('InvalidPasswordException'))
+
+    const res = await app.request('/link/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validBody),
+    })
+    expect(res.status).toBe(400)
+    const body = await res.json() as { error: { code: string } }
+    expect(body.error.code).toBe('WEAK_PASSWORD')
+  })
+
   it('links existing external-provider users to the native account and records the method', async () => {
     mockConfirmSignUp.mockResolvedValueOnce({})
     mockListUsersByEmail.mockResolvedValueOnce([
