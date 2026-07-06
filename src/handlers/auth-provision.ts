@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { PreTokenGenerationTriggerHandler } from 'aws-lambda'
 import { GetCommand, PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb'
 import { dynamo } from '../lib/dynamo.js'
-import type { OrgRole } from '@heediq/shared'
+import { createLogger, type OrgRole } from '@heediq/shared'
 
 // Separate Lambda entry point (own env vars, not the full API config) — this fires on every
 // Cognito token issuance (D-077) and must stay minimal and fast (5s trigger timeout).
@@ -14,6 +14,7 @@ function requireEnv(name: string): string {
 
 const ORGS_TABLE = requireEnv('ORGS_TABLE_NAME')
 const USERS_TABLE = requireEnv('USERS_TABLE_NAME')
+const logger = createLogger('heediq-api')
 
 export const handler: PreTokenGenerationTriggerHandler = async (event) => {
   const userId = event.request.userAttributes['sub']
@@ -57,6 +58,7 @@ export const handler: PreTokenGenerationTriggerHandler = async (event) => {
       })),
     ])
 
+    logger.info('New org provisioned at first login', { userId, orgId, federated: isFederatedLogin(event) })
     event.response = {
       claimsOverrideDetails: {
         claimsToAddOrOverride: { 'custom:orgId': orgId, 'custom:role': role },
@@ -65,6 +67,7 @@ export const handler: PreTokenGenerationTriggerHandler = async (event) => {
     return event
   }
 
+  logger.info('Existing user resolved at login', { userId, orgId: existing['orgId'] })
   event.response = {
     claimsOverrideDetails: {
       claimsToAddOrOverride: {

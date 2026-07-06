@@ -7,6 +7,7 @@ import {
   AdminLinkProviderForUserCommand,
 } from '@aws-sdk/client-cognito-identity-provider'
 import { dynamo } from '../lib/dynamo.js'
+import { createLogger } from '@heediq/shared'
 
 function requireEnv(name: string): string {
   const v = process.env[name]
@@ -18,6 +19,7 @@ const USERS_TABLE = requireEnv('USERS_TABLE_NAME')
 const USER_AUTH_METHODS_TABLE = requireEnv('USER_AUTH_METHODS_TABLE_NAME')
 
 const cognito = new CognitoIdentityProviderClient({})
+const logger = createLogger('heediq-api')
 
 function isAwsError(err: unknown): err is { name: string } {
   return typeof err === 'object' && err !== null && 'name' in err
@@ -127,9 +129,11 @@ export const handler: PreSignUpTriggerHandler = async (event) => {
   let destinationUsername = await findDestinationUsername(userPoolId, email)
   if (!destinationUsername && accountId) {
     destinationUsername = await autoHealNativeUser(userPoolId, email)
+    logger.info('Auto-healed native user for proactive link', { accountId, providerName })
   }
   if (!destinationUsername) {
     // No existing account for this email — Cognito creates the external-provider user as new.
+    logger.info('No existing account to link — new external-provider user', { providerName })
     return event
   }
 
@@ -142,6 +146,7 @@ export const handler: PreSignUpTriggerHandler = async (event) => {
   } catch (err: unknown) {
     if (!isAwsError(err)) throw err
     if (err.name === 'AliasExistsException' || err.name === 'ResourceConflictException') {
+      logger.warn('Proactive link rejected — email already linked to another account', { accountId, providerName, errName: err.name })
       throw new Error('This email is already linked to another account. Use your original sign-in method or contact support.')
     }
     if (err.name === 'InvalidParameterException') {
@@ -152,6 +157,7 @@ export const handler: PreSignUpTriggerHandler = async (event) => {
     throw err
   }
 
+  logger.info('Proactively linked external provider to native account', { accountId, providerName })
   if (accountId) await upsertAuthMethod(accountId, providerName, providerSub, event.userName)
   return event
 }

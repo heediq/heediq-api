@@ -1,6 +1,7 @@
 import type { PostConfirmationTriggerHandler } from 'aws-lambda'
 import { QueryCommand, PutCommand } from '@aws-sdk/lib-dynamodb'
 import { dynamo } from '../lib/dynamo.js'
+import { createLogger } from '@heediq/shared'
 
 function requireEnv(name: string): string {
   const v = process.env[name]
@@ -11,6 +12,7 @@ function requireEnv(name: string): string {
 const USERS_TABLE = requireEnv('USERS_TABLE_NAME')
 const USER_AUTH_METHODS_TABLE = requireEnv('USER_AUTH_METHODS_TABLE_NAME')
 const AUTH_AUDIT_LOG_TABLE = requireEnv('AUTH_AUDIT_LOG_TABLE_NAME')
+const logger = createLogger('heediq-api')
 
 function isAwsError(err: unknown): err is { name: string } {
   return typeof err === 'object' && err !== null && 'name' in err
@@ -96,5 +98,9 @@ export const handler: PostConfirmationTriggerHandler = async (event) => {
     },
   }))
 
+  logger.info('Signup confirmed — auth method recorded', {
+    accountId: canonicalAccountId,
+    provider: providerContext?.providerName ?? 'COGNITO',
+  })
   return event
 }

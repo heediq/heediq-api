@@ -4,10 +4,11 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { apiError, ok } from '../lib/errors.js'
 import { config } from '../config.js'
 import type { AuthContext } from '../middleware/auth.js'
-import { PresignUploadRequestSchema } from '@heediq/shared'
+import { PresignUploadRequestSchema, createLogger } from '@heediq/shared'
 
 const s3 = new S3Client({})
 const upload = new Hono<AuthContext>()
+const logger = createLogger('heediq-api')
 
 // POST /api/v1/upload/presign — get S3 presigned PUT URL for direct client upload
 upload.post('/presign', async (c) => {
@@ -30,6 +31,7 @@ upload.post('/presign', async (c) => {
     { expiresIn: config.s3.presignedUrlExpiresIn },
   )
 
+  logger.info('Presigned upload URL issued', { orgId, sourceId: parsed.data.sourceId, s3Key })
   return ok(c, { uploadUrl, s3Key, expiresIn: config.s3.presignedUrlExpiresIn })
 })
 

@@ -7,6 +7,7 @@ import {
   type UserType,
 } from '@aws-sdk/client-cognito-identity-provider'
 import { dynamo } from '../lib/dynamo.js'
+import { createLogger } from '@heediq/shared'
 
 function requireEnv(name: string): string {
   const v = process.env[name]
@@ -19,6 +20,7 @@ const USER_AUTH_METHODS_TABLE = requireEnv('USER_AUTH_METHODS_TABLE_NAME')
 const AUTH_AUDIT_LOG_TABLE = requireEnv('AUTH_AUDIT_LOG_TABLE_NAME')
 
 const cognito = new CognitoIdentityProviderClient({})
+const logger = createLogger('heediq-api')
 
 function isAwsError(err: unknown): err is { name: string } {
   return typeof err === 'object' && err !== null && 'name' in err
@@ -122,6 +124,7 @@ export const handler: PostAuthenticationTriggerHandler = async (event) => {
   }
 
   if (currentIsExternal && !providerContext) {
+    logger.warn('External-provider login had no resolvable identities payload', { accountId: canonicalAccountId })
     await putAudit(canonicalAccountId, 'POST_AUTH_PROVIDER_CONTEXT_MISSING', 'UNKNOWN', 'External-provider login had no resolvable identities payload')
     return event
   }
@@ -141,6 +144,7 @@ export const handler: PostAuthenticationTriggerHandler = async (event) => {
       SourceUser: { ProviderName: providerContext.providerName, ProviderAttributeName: 'Cognito_Subject', ProviderAttributeValue: providerContext.providerSub },
     }))
     await putAudit(canonicalAccountId, 'AUTO_LINK_POST_AUTH', providerContext.providerName, `Linked ${providerContext.providerName} to native user ${nativeUser.Username}`)
+    logger.info('Auto-linked external provider to native account post-auth', { accountId: canonicalAccountId, provider: providerContext.providerName })
   } catch (err: unknown) {
     if (!isAwsError(err)) throw err
     if (err.name !== 'InvalidParameterException' && err.name !== 'ResourceConflictException') throw err
