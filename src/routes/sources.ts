@@ -125,6 +125,7 @@ sources.patch('/:id', async (c) => {
     ReturnValues: 'ALL_NEW',
   }))
 
+  logger.info('Source updated', { requestId: c.get('requestId'), sourceId: id, orgId })
   return ok(c, { source: SourceSchema.parse(res.Attributes) })
 })
 
@@ -141,6 +142,7 @@ sources.delete('/:id', async (c) => {
     ExpressionAttributeNames: { '#status': 'status' },
     ExpressionAttributeValues: { ':orgId': orgId, ':status': 'failed', ':now': now },
   }))
+  logger.info('Source soft-deleted', { requestId: c.get('requestId'), sourceId: id, orgId })
   return ok(c, { deleted: true })
 })
 

@@ -3,7 +3,8 @@ import { QueryCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb'
 import { dynamo } from '../lib/dynamo.js'
 import { apiError, ok } from '../lib/errors.js'
 import { config } from '../config.js'
-import { LookupEmailRequestSchema, LinkStartRequestSchema, LinkVerifyOtpRequestSchema, LinkConfirmRequestSchema, UserSchema } from '@heediq/shared'
+import { LookupEmailRequestSchema, LinkStartRequestSchema, LinkVerifyOtpRequestSchema, LinkConfirmRequestSchema, UserSchema, createLogger } from '@heediq/shared'
+import type { RequestIdContext } from '../middleware/request-id.js'
 import {
   signUp,
   resendConfirmationCode,
@@ -17,7 +18,8 @@ import {
   randomPassword,
 } from '../lib/cognito.js'
 
-const auth = new Hono()
+const auth = new Hono<RequestIdContext>()
+const logger = createLogger('heediq-api')
 
 function isAwsError(err: unknown): err is { name: string } {
   return typeof err === 'object' && err !== null && 'name' in err
@@ -116,6 +118,7 @@ auth.post('/link/request-otp', async (c) => {
   } catch (err: unknown) {
     if (!isAwsError(err)) throw err
     if (err.name === 'LimitExceededException') {
+      logger.warn('OTP request rate-limited', { requestId: c.get('requestId') })
       return apiError(c, 'RATE_LIMITED', 'Too many attempts — try again shortly')
     }
     // A native Cognito user already exists (e.g. mid-confirmation, or already fully set up) —
@@ -126,6 +129,7 @@ auth.post('/link/request-otp', async (c) => {
         await resendConfirmationCode(email)
       } catch (resendErr: unknown) {
         if (isAwsError(resendErr) && resendErr.name === 'LimitExceededException') {
+          logger.warn('OTP resend rate-limited', { requestId: c.get('requestId') })
           return apiError(c, 'RATE_LIMITED', 'Too many attempts — try again shortly')
         }
         // Swallow other resend failures too (e.g. already CONFIRMED, nothing to resend) —
@@ -134,6 +138,7 @@ auth.post('/link/request-otp', async (c) => {
     }
   }
 
+  logger.info('OTP sent for account link/verify', { requestId: c.get('requestId') })
   return ok(c, { sent: true })
 })
 
@@ -162,9 +167,11 @@ auth.post('/link/verify-otp', async (c) => {
     // an EXTERNAL_PROVIDER user) throws NotAuthorizedException regardless of what code was
     // submitted. Treating that as "already confirmed, proceed" let anyone bypass the code
     // entirely for any existing account by just knowing its email — always reject instead.
+    logger.warn('OTP verification rejected', { requestId: c.get('requestId'), errName: err.name })
     return apiError(c, 'BAD_REQUEST', 'Invalid or expired verification code')
   }
 
+  logger.info('OTP verified', { requestId: c.get('requestId') })
   return ok(c, { verified: true })
 })
 
@@ -196,8 +203,10 @@ auth.post('/link/confirm', async (c) => {
     // policy — distinct from every other failure here, so the frontend can show a
     // requirements-specific message instead of a generic one.
     if (isAwsError(err) && err.name === 'InvalidPasswordException') {
+      logger.warn('Password link rejected — weak password', { requestId: c.get('requestId') })
       return apiError(c, 'WEAK_PASSWORD', 'Password does not meet the requirements')
     }
+    logger.error('Failed to set password during account link', { requestId: c.get('requestId') })
     return apiError(c, 'BAD_REQUEST', 'Failed to set password')
   }
 
@@ -211,6 +220,7 @@ auth.post('/link/confirm', async (c) => {
       if (!isAwsError(err)) throw err
       if (err.name === 'InvalidParameterException') continue // already linked
       if (err.name === 'AliasExistsException' || err.name === 'ResourceConflictException') {
+        logger.warn('Account link confirm rejected — already linked to another user', { requestId: c.get('requestId') })
         return apiError(c, 'CONFLICT', 'This account is already linked to another user')
       }
       throw err
@@ -221,6 +231,7 @@ auth.post('/link/confirm', async (c) => {
   const canonicalAccountId = await resolveCanonicalAccountId(email, nativeSub)
   await recordAuthMethodAndAudit(canonicalAccountId, nativeUser.Username)
 
+  logger.info('Password set and providers linked', { requestId: c.get('requestId'), accountId: canonicalAccountId })
   return ok(c, { passwordSet: true })
 })
 
