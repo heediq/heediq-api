@@ -9,6 +9,7 @@ type ErrorCode =
   | 'BAD_REQUEST'
   | 'CONFLICT'
   | 'RATE_LIMITED'
+  | 'WEAK_PASSWORD'
   | 'INTERNAL_ERROR'
 
 const statusForCode: Record<ErrorCode, ContentfulStatusCode> = {
@@ -18,6 +19,7 @@ const statusForCode: Record<ErrorCode, ContentfulStatusCode> = {
   BAD_REQUEST: 400,
   CONFLICT: 409,
   RATE_LIMITED: 429,
+  WEAK_PASSWORD: 400,
   INTERNAL_ERROR: 500,
 }
 
