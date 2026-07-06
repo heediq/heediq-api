@@ -18,7 +18,7 @@ All Heediq REST endpoints in a single Lambda function. Handles auth, Source CRUD
 - `src/routes/me.ts` — `GET /api/v1/me`
 - `src/routes/sources.ts` — Source CRUD + job enqueue + summary fetch (D-068)
 - `src/routes/upload.ts` — `POST /api/v1/upload/presign` (S3 presigned URL)
-- `src/routes/auth.ts` — unauthenticated `/api/v1/auth` sub-app: `lookup-email` + D-087 cross-provider linking (`link/request-otp`, `link/confirm`)
+- `src/routes/auth.ts` — unauthenticated `/api/v1/auth` sub-app: `lookup-email` + D-087/D-089 cross-provider linking (`link/request-otp`, `link/verify-otp`, `link/confirm`)
 - `src/lib/cognito.ts` — Cognito Identity Provider SDK wrapper (`SignUp`, `ConfirmSignUp`, `ResendConfirmationCode`, `AdminSetUserPassword`, `AdminLinkProviderForUser`, `AdminCreateUser`, `ListUsers`) used by `routes/auth.ts` and the trigger handlers below
 - `src/handlers/auth-provision.ts` — Cognito PreTokenGeneration trigger (D-077): idempotent get-or-create of org+user, injects `custom:orgId`/`custom:role` claims. Resolves the existing row **by email first, falling back to `sub`** (`resolveExistingUser`) — a post-linking re-login presents the destination/native user's `sub`, not the original federated `sub`, so an email-first lookup avoids provisioning a duplicate org. No `email_verified` gate (D-090) — provisioning is unconditional on first login for any method, since D-089 makes ownership of the email Heediq's own responsibility, not an IdP-asserted claim.
 - `src/routes/auth-methods.ts` — authenticated `GET /api/v1/auth/methods` (D-091): lists the caller's active sign-in methods from `heediq-user-auth-methods`, scoped to their own `userId`
@@ -59,11 +59,12 @@ POST   /api/v1/upload/presign         { sourceId, contentType, fileSizeBytes }
 
 POST   /api/v1/auth/lookup-email      { email } -> { exists, passwordSet }              (unauthenticated)
 POST   /api/v1/auth/link/request-otp  { email }  -> { sent: true }                       (unauthenticated, D-087)
-POST   /api/v1/auth/link/confirm      { email, code, newPassword } -> { passwordSet: true } (unauthenticated, D-087)
+POST   /api/v1/auth/link/verify-otp   { email, code } -> { verified: true }              (unauthenticated, D-089)
+POST   /api/v1/auth/link/confirm      { email, newPassword } -> { passwordSet: true }    (unauthenticated, D-087/D-089)
 GET    /api/v1/auth/methods           -> { methods: [{ provider, linkedAt }] }             (authenticated, D-091)
 ```
 
-**D-087 linking flow:** `request-otp` calls Cognito `SignUp` (creating a native `UNCONFIRMED` user so Cognito emails its own verification code) or falls back to `ResendConfirmationCode` if the native user already exists mid-flow; it always returns `{ sent: true }` regardless of outcome to avoid account-existence enumeration. `confirm` calls `ConfirmSignUp` (any failure — including `NotAuthorizedException` from an already-confirmed/non-`UNCONFIRMED` account — is rejected as an invalid code, never bypassed), `AdminSetUserPassword` (an `InvalidPasswordException` here returns error code `WEAK_PASSWORD` instead of the generic `BAD_REQUEST`, so the frontend can show a policy-specific message — see `@heediq/shared`'s `passwordPolicy.ts`), then `AdminLinkProviderForUser` for every external-provider user found for that email, and records the auth method once linking succeeds.
+**D-087/D-089 linking flow:** `request-otp` calls Cognito `SignUp` (creating a native `UNCONFIRMED` user so Cognito emails its own verification code) or falls back to `ResendConfirmationCode` if the native user already exists mid-flow; it always returns `{ sent: true }` regardless of outcome to avoid account-existence enumeration. `verify-otp` calls `ConfirmSignUp` on its own, before any password is collected (D-089) — any failure (including `NotAuthorizedException` from an already-confirmed/non-`UNCONFIRMED` account) is rejected as an invalid code, never bypassed; the code is consumed here and is never sent again. `confirm` is called only after `verify-otp` has already succeeded — it calls `AdminSetUserPassword` (an `InvalidPasswordException` here returns error code `WEAK_PASSWORD` instead of the generic `BAD_REQUEST`, so the frontend can show a policy-specific message — see `@heediq/shared`'s `passwordPolicy.ts`), then `AdminLinkProviderForUser` for every external-provider user found for that email, and records the auth method once linking succeeds.
 
 **D-091 active methods:** `heediq-user-auth-methods` is the authoritative source of truth for which
 methods are active on an account — `GET /auth/methods` is a straight `Query` on `pk = USER#<userId>`,

@@ -125,51 +125,78 @@ describe('POST /auth/link/request-otp (D-087)', () => {
   })
 })
 
-describe('POST /auth/link/confirm (D-087)', () => {
+describe('POST /auth/link/verify-otp (D-089)', () => {
   beforeEach(() => { vi.clearAllMocks() })
 
-  const validBody = { email: 'a@b.com', code: '123456', newPassword: 'password123' }
+  const validBody = { email: 'a@b.com', code: '123456' }
 
   it('rejects an invalid request body', async () => {
-    const res = await app.request('/link/confirm', {
+    const res = await app.request('/link/verify-otp', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'a@b.com', code: '', newPassword: 'short' }),
+      body: JSON.stringify({ email: 'a@b.com', code: '' }),
     })
     expect(res.status).toBe(400)
   })
 
   it('returns 400 for a genuinely invalid/expired code', async () => {
     mockConfirmSignUp.mockRejectedValueOnce(awsError('CodeMismatchException'))
-    const res = await app.request('/link/confirm', {
+    const res = await app.request('/link/verify-otp', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(validBody),
     })
     expect(res.status).toBe(400)
+  })
+
+  // Regression for the OTP-bypass bug: this is the endpoint the frontend's code screen must
+  // call before it is allowed to advance to the password screen — /link/confirm no longer
+  // takes a code at all, so if this check is skipped, no code is ever verified.
+  it('verifies a correct code and does not set a password', async () => {
+    mockConfirmSignUp.mockResolvedValueOnce({})
+    const res = await app.request('/link/verify-otp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validBody),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { data: { verified: boolean } }
+    expect(body.data).toEqual({ verified: true })
     expect(mockAdminSetUserPassword).not.toHaveBeenCalled()
   })
 
-  // Regression for the OTP-bypass bug: Cognito's ConfirmSignUp throws NotAuthorizedException
-  // for any user that isn't UNCONFIRMED — including an already-set-up account (native, or an
-  // email alias resolving to an existing EXTERNAL_PROVIDER/IdP-linked user) — regardless of
-  // what code was submitted. Any code must be rejected in that case, not treated as "already
-  // confirmed, proceed" (which previously let anyone set a password on any known email with no
-  // real code check at all).
+  // Cognito's ConfirmSignUp throws NotAuthorizedException for any user that isn't UNCONFIRMED
+  // — including an already-set-up account (native, or an email alias resolving to an existing
+  // EXTERNAL_PROVIDER/IdP-linked user) — regardless of what code was submitted. Any code must
+  // be rejected in that case, not treated as "already confirmed, proceed" (which previously
+  // let anyone set a password on any known email with no real code check at all).
   it('rejects any code against an already-confirmed/existing account instead of bypassing verification', async () => {
     mockConfirmSignUp.mockRejectedValueOnce(awsError('NotAuthorizedException'))
 
-    const res = await app.request('/link/confirm', {
+    const res = await app.request('/link/verify-otp', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(validBody),
     })
     expect(res.status).toBe(400)
-    expect(mockAdminSetUserPassword).not.toHaveBeenCalled()
+  })
+})
+
+describe('POST /auth/link/confirm (D-087, D-089)', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  const validBody = { email: 'a@b.com', newPassword: 'password123' }
+
+  it('rejects an invalid request body', async () => {
+    const res = await app.request('/link/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'a@b.com', newPassword: 'short' }),
+    })
+    expect(res.status).toBe(400)
   })
 
   it('returns 400 when no native user exists to attach the password to', async () => {
-    mockConfirmSignUp.mockResolvedValueOnce({})
     mockListUsersByEmail.mockResolvedValueOnce([{ Username: 'google_123', UserStatus: 'EXTERNAL_PROVIDER' }])
 
     const res = await app.request('/link/confirm', {
@@ -181,7 +208,6 @@ describe('POST /auth/link/confirm (D-087)', () => {
   })
 
   it('returns WEAK_PASSWORD when Cognito rejects the password on policy grounds', async () => {
-    mockConfirmSignUp.mockResolvedValueOnce({})
     mockListUsersByEmail.mockResolvedValueOnce([{ Username: 'a@b.com', UserStatus: 'CONFIRMED', sub: 'native-sub' }])
     mockAdminSetUserPassword.mockRejectedValueOnce(awsError('InvalidPasswordException'))
 
@@ -196,7 +222,6 @@ describe('POST /auth/link/confirm (D-087)', () => {
   })
 
   it('links existing external-provider users to the native account and records the method', async () => {
-    mockConfirmSignUp.mockResolvedValueOnce({})
     mockListUsersByEmail.mockResolvedValueOnce([
       { Username: 'a@b.com', UserStatus: 'CONFIRMED', sub: 'native-sub' },
       { Username: 'Google_g1', UserStatus: 'EXTERNAL_PROVIDER', identities: [{ providerName: 'Google', providerUserId: 'g1' }] },
@@ -217,7 +242,6 @@ describe('POST /auth/link/confirm (D-087)', () => {
   })
 
   it('treats InvalidParameterException on link as already-linked and continues', async () => {
-    mockConfirmSignUp.mockResolvedValueOnce({})
     mockListUsersByEmail.mockResolvedValueOnce([
       { Username: 'a@b.com', UserStatus: 'CONFIRMED', sub: 'native-sub' },
       { Username: 'Google_g1', UserStatus: 'EXTERNAL_PROVIDER', identities: [{ providerName: 'Google', providerUserId: 'g1' }] },
@@ -235,7 +259,6 @@ describe('POST /auth/link/confirm (D-087)', () => {
   })
 
   it('returns 409 when the provider is already linked to a different account', async () => {
-    mockConfirmSignUp.mockResolvedValueOnce({})
     mockListUsersByEmail.mockResolvedValueOnce([
       { Username: 'a@b.com', UserStatus: 'CONFIRMED', sub: 'native-sub' },
       { Username: 'Google_g1', UserStatus: 'EXTERNAL_PROVIDER', identities: [{ providerName: 'Google', providerUserId: 'g1' }] },
