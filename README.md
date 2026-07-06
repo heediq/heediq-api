@@ -94,7 +94,7 @@ new router follows the same pattern — mount it in `app.ts`, don't hardcode the
 ## Testing
 
 ```bash
-pnpm run test          # 65 unit tests (auth routes + auth methods + auth triggers + sources + app routing)
+pnpm run test          # 66 unit tests (auth routes + auth methods + auth triggers + sources + app routing)
 pnpm run typecheck     # tsc --noEmit
 pnpm run test:pre-pr   # typecheck + test (run before opening a PR)
 pnpm run dev           # local dev server on :3000 (tsx watch)
