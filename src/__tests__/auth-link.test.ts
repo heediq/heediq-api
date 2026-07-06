@@ -150,19 +150,22 @@ describe('POST /auth/link/confirm (D-087)', () => {
     expect(mockAdminSetUserPassword).not.toHaveBeenCalled()
   })
 
-  it('tolerates NotAuthorizedException (already confirmed) and proceeds', async () => {
+  // Regression for the OTP-bypass bug: Cognito's ConfirmSignUp throws NotAuthorizedException
+  // for any user that isn't UNCONFIRMED — including an already-set-up account (native, or an
+  // email alias resolving to an existing EXTERNAL_PROVIDER/IdP-linked user) — regardless of
+  // what code was submitted. Any code must be rejected in that case, not treated as "already
+  // confirmed, proceed" (which previously let anyone set a password on any known email with no
+  // real code check at all).
+  it('rejects any code against an already-confirmed/existing account instead of bypassing verification', async () => {
     mockConfirmSignUp.mockRejectedValueOnce(awsError('NotAuthorizedException'))
-    mockListUsersByEmail.mockResolvedValueOnce([{ Username: 'a@b.com', UserStatus: 'CONFIRMED', sub: 'native-sub' }])
-    mockAdminSetUserPassword.mockResolvedValueOnce({})
-    mockDynamoSend.mockResolvedValue({ Items: [] })
 
     const res = await app.request('/link/confirm', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(validBody),
     })
-    expect(res.status).toBe(200)
-    expect(mockAdminSetUserPassword).toHaveBeenCalledWith('a@b.com', 'password123')
+    expect(res.status).toBe(400)
+    expect(mockAdminSetUserPassword).not.toHaveBeenCalled()
   })
 
   it('returns 400 when no native user exists to attach the password to', async () => {
