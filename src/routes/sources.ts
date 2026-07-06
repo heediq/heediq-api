@@ -8,6 +8,7 @@ import { dynamo } from '../lib/dynamo.js'
 import { apiError, ok } from '../lib/errors.js'
 import { config } from '../config.js'
 import type { AuthContext } from '../middleware/auth.js'
+import type { RequestIdContext } from '../middleware/request-id.js'
 import {
   SourceSchema,
   JobSchema,
@@ -16,14 +17,18 @@ import {
   UpdateSourceRequestSchema,
   EnqueueJobRequestSchema,
   PresignUploadRequestSchema,
+  createLogger,
   type Source,
   type TranscriptionJobMessage,
 } from '@heediq/shared'
 
 const sqs = new SQSClient({})
 const s3 = new S3Client({})
+const logger = createLogger('heediq-api')
 
-const sources = new Hono<AuthContext>()
+type SourcesContext = AuthContext & RequestIdContext
+
+const sources = new Hono<SourcesContext>()
 
 // GET /api/v1/sources — list org sources, cursor-paginated
 sources.get('/', async (c) => {
@@ -81,6 +86,7 @@ sources.post('/', async (c) => {
   }
 
   await dynamo.send(new PutCommand({ TableName: config.dynamo.sourcesTable, Item: source }))
+  logger.info('Source created', { requestId: c.get('requestId'), sourceId: source.sourceId, orgId })
   return ok(c, { source }, 201)
 })
 
@@ -199,6 +205,13 @@ sources.post('/:id/jobs', async (c) => {
     },
   }))
 
+  logger.info('Transcription job enqueued', {
+    requestId: c.get('requestId'),
+    sourceId: id,
+    jobId,
+    tier,
+    model: parsed.data.model,
+  })
   return ok(c, { job: JobSchema.parse(jobItem) }, 201)
 })
 
