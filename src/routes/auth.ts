@@ -1,10 +1,13 @@
 import { Hono } from 'hono'
+import type { Context } from 'hono'
+import { getConnInfo } from 'hono/aws-lambda'
 import { QueryCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb'
 import { dynamo } from '../lib/dynamo.js'
 import { apiError, ok } from '../lib/errors.js'
 import { config } from '../config.js'
 import { LookupEmailRequestSchema, LinkStartRequestSchema, LinkVerifyOtpRequestSchema, LinkConfirmRequestSchema, UserSchema, createLogger } from '@heediq/shared'
 import type { RequestIdContext } from '../middleware/request-id.js'
+import { checkRateLimit } from '../lib/rateLimit.js'
 import {
   signUp,
   resendConfirmationCode,
@@ -114,6 +117,31 @@ async function handleExistingNativeUser(email: string, requestId: string | undef
   return false
 }
 
+// D-097 — app-level throttling for the two unauthenticated OTP endpoints, keyed by email
+// *and* IP. Email-side is deliberately generous (an attacker looping this deliberately to
+// lock out a real user would need a sustained, easily-noticed pattern); IP-side is tighter
+// since one caller hammering the route from a single IP has no legitimate reason to. Either
+// key tripping returns the identical RATE_LIMITED shape as Cognito's own LimitExceededException
+// (D-078 non-disclosure — the caller never learns which layer or key blocked them).
+function getClientIp(c: Context): string {
+  // getConnInfo reads the Lambda event's requestContext — absent outside a real API Gateway
+  // invocation (local dev, tests), so fall back rather than let the route 500.
+  try {
+    return getConnInfo(c).remote.address ?? 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
+async function isOtpRateLimited(c: Context, route: string, email: string): Promise<boolean> {
+  const ip = getClientIp(c)
+  const [emailLimited, ipLimited] = await Promise.all([
+    checkRateLimit(route, 'EMAIL', email, 5, 900),
+    checkRateLimit(route, 'IP', ip, 10, 60),
+  ])
+  return emailLimited || ipLimited
+}
+
 // POST /api/v1/auth/lookup-email — unauthenticated (D-078). Drives the unified sign-in
 // screen's next step. Response never reveals which IdP an existing account uses — only
 // whether the email exists and whether a password can be used to sign in.
@@ -162,6 +190,11 @@ auth.post('/link/request-otp', async (c) => {
   }
   const email = parsed.data.email
 
+  if (await isOtpRateLimited(c, 'REQUEST_OTP', email)) {
+    logger.warn('OTP request rate-limited', { requestId: c.get('requestId') })
+    return apiError(c, 'RATE_LIMITED', 'Too many attempts — try again shortly')
+  }
+
   try {
     await signUp(email, randomPassword())
   } catch (err: unknown) {
@@ -201,6 +234,11 @@ auth.post('/link/verify-otp', async (c) => {
     return apiError(c, 'BAD_REQUEST', 'Invalid request body', parsed.error.flatten())
   }
   const { email, code } = parsed.data
+
+  if (await isOtpRateLimited(c, 'VERIFY_OTP', email)) {
+    logger.warn('OTP verify rate-limited', { requestId: c.get('requestId') })
+    return apiError(c, 'RATE_LIMITED', 'Too many attempts — try again shortly')
+  }
 
   try {
     await confirmSignUp(email, code)

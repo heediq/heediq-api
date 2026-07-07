@@ -9,6 +9,7 @@ const mockAdminSetUserPassword = vi.hoisted(() => vi.fn())
 const mockAdminLinkProviderForUser = vi.hoisted(() => vi.fn())
 const mockAdminDeleteUser = vi.hoisted(() => vi.fn())
 const mockListUsersByEmail = vi.hoisted(() => vi.fn())
+const mockCheckRateLimit = vi.hoisted(() => vi.fn())
 
 vi.mock('../config.js', () => ({
   config: {
@@ -21,6 +22,7 @@ vi.mock('../config.js', () => ({
       wsConnectionsTable: 'heediq-ws-connections',
       userAuthMethodsTable: 'heediq-user-auth-methods',
       authAuditLogTable: 'heediq-auth-audit-log',
+      rateLimitsTable: 'heediq-rate-limits',
     },
     s3: { audioBucket: 'heediq-audio', presignedUrlExpiresIn: 900 },
     sqs: { transcriptionQueueUrl: 'https://sqs/transcription', summarizationQueueUrl: 'https://sqs/summarization' },
@@ -29,6 +31,8 @@ vi.mock('../config.js', () => ({
 }))
 
 vi.mock('../lib/dynamo.js', () => ({ dynamo: { send: mockDynamoSend } }))
+
+vi.mock('../lib/rateLimit.js', () => ({ checkRateLimit: mockCheckRateLimit }))
 
 vi.mock('../lib/cognito.js', () => ({
   signUp: mockSignUp,
@@ -57,7 +61,10 @@ function awsError(name: string) {
 }
 
 describe('POST /auth/link/request-otp (D-087)', () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockCheckRateLimit.mockResolvedValue(false)
+  })
 
   it('rejects an invalid email', async () => {
     const res = await app.request('/link/request-otp', {
@@ -179,10 +186,26 @@ describe('POST /auth/link/request-otp (D-087)', () => {
     })
     expect(res.status).toBe(429)
   })
+
+  // D-097: app-level throttling must reject before Cognito is ever called, so a blocked
+  // caller can't burn through Cognito's own SES-backed send quota either.
+  it('returns 429 from the app-level limiter without calling Cognito', async () => {
+    mockCheckRateLimit.mockResolvedValueOnce(true) // email key trips
+    const res = await app.request('/link/request-otp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'flooded@b.com' }),
+    })
+    expect(res.status).toBe(429)
+    expect(mockSignUp).not.toHaveBeenCalled()
+  })
 })
 
 describe('POST /auth/link/verify-otp (D-089)', () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockCheckRateLimit.mockResolvedValue(false)
+  })
 
   const validBody = { email: 'a@b.com', code: '123456' }
 
@@ -235,6 +258,18 @@ describe('POST /auth/link/verify-otp (D-089)', () => {
       body: JSON.stringify(validBody),
     })
     expect(res.status).toBe(400)
+  })
+
+  // D-097: blocks brute-forcing the code itself, not just repeated request-otp calls.
+  it('returns 429 from the app-level limiter without calling Cognito', async () => {
+    mockCheckRateLimit.mockResolvedValueOnce(true) // IP key trips
+    const res = await app.request('/link/verify-otp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validBody),
+    })
+    expect(res.status).toBe(429)
+    expect(mockConfirmSignUp).not.toHaveBeenCalled()
   })
 })
 

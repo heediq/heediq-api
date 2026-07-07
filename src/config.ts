@@ -22,6 +22,7 @@ export const config = {
     wsConnectionsTable: requireEnv('WS_CONNECTIONS_TABLE_NAME'),
     userAuthMethodsTable: requireEnv('USER_AUTH_METHODS_TABLE_NAME'),
     authAuditLogTable: requireEnv('AUTH_AUDIT_LOG_TABLE_NAME'),
+    rateLimitsTable: requireEnv('RATE_LIMITS_TABLE_NAME'),
   },
   s3: {
     audioBucket: requireEnv('AUDIO_BUCKET_NAME'),
