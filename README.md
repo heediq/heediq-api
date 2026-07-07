@@ -66,6 +66,19 @@ GET    /api/v1/auth/methods           -> { methods: [{ provider, linkedAt }] }  
 
 **D-087/D-089 linking flow:** `request-otp` calls Cognito `SignUp` (creating a native `UNCONFIRMED` user so Cognito emails its own verification code) or falls back to `ResendConfirmationCode` if the native user already exists mid-flow. If that existing native user is stuck `CONFIRMED` but never had a password set (abandoned between the `verify-otp` and `confirm` screens — D-096, since Cognito permanently refuses to resend a code to a `CONFIRMED` user), it self-heals by deleting that orphaned user (`AdminDeleteUser`) and re-running `SignUp` so a fresh code goes out; a `CONFIRMED` user that *does* have a password set (`passwordSet: true` in `heediq-users`) is a real linked account and is left untouched. It always returns `{ sent: true }` regardless of outcome to avoid account-existence enumeration. `verify-otp` calls `ConfirmSignUp` on its own, before any password is collected (D-089) — any failure (including `NotAuthorizedException` from an already-confirmed/non-`UNCONFIRMED` account) is rejected as an invalid code, never bypassed; the code is consumed here and is never sent again. `confirm` is called only after `verify-otp` has already succeeded — it calls `AdminSetUserPassword` (an `InvalidPasswordException` here returns error code `WEAK_PASSWORD` instead of the generic `BAD_REQUEST`, so the frontend can show a policy-specific message — see `@heediq/shared`'s `passwordPolicy.ts`), then `AdminLinkProviderForUser` for every external-provider user found for that email, and records the auth method once linking succeeds.
 
+**D-097/D-098 OTP rate limiting:** `request-otp` and `verify-otp` are unauthenticated, so both are
+also guarded by an app-level limiter (`src/lib/rateLimit.ts`) on top of the infra-level API Gateway
+throttling (`heediq-infra/README.md`): a DynamoDB fixed-window counter checks both the email being
+targeted (5 requests / 15 min) and the caller's source IP, resolved via `getClientIp` — a try/catch
+wrapper around `hono/aws-lambda`'s `getConnInfo`, since that helper throws outside a real Lambda
+invocation (10 requests / 60 sec). Either key tripping returns the same `RATE_LIMITED` error shape
+Cognito's own `LimitExceededException` would produce, before Cognito is ever called — preserving the
+non-disclosure guarantee from D-078. The window boundary is baked into the partition key itself
+(`bucketStart = floor(now / windowSeconds) * windowSeconds`); the `expiresAt` TTL attribute is
+storage cleanup only, not correctness (DynamoDB TTL deletion isn't immediately timed). A prod-only
+WAF rate-based rule is scaffolded in `heediq-infra` but shipped disabled until a marketing campaign
+is planned (D-098) — see `heediq-infra/README.md`'s ApiStack section.
+
 **D-091 active methods:** `heediq-user-auth-methods` is the authoritative source of truth for which
 methods are active on an account — `GET /auth/methods` is a straight `Query` on `pk = USER#<userId>`,
 `begins_with(sk, METHOD#)`, scoped to the caller's own `userId` (cross-org/account isolation).
@@ -91,11 +104,12 @@ new router follows the same pattern — mount it in `app.ts`, don't hardcode the
 - Downstream: `heediq-worker-transcription` (reads SQS messages enqueued here), `heediq-worker-summarization` (reads SQS from text-upload path)
 - Shared surfaces: `heediq-sources`, `heediq-jobs` DynamoDB tables
 - Upstream (auth): `heediq-infra`'s `UserAuthMethodsTable`/`AuthAuditLogTable` (D-087) and the Cognito User Pool triggers wired to the 3 `auth-trigger-*.ts` handlers — see `heediq-infra/README.md`
+- Upstream (auth): `heediq-infra`'s `heediq-rate-limits` table (D-097) backing `src/lib/rateLimit.ts`
 
 ## Testing
 
 ```bash
-pnpm run test          # 66 unit tests (auth routes + auth methods + auth triggers + sources + app routing)
+pnpm run test          # 78 unit tests (auth routes + auth methods + auth triggers + sources + app routing + rate limiting)
 pnpm run typecheck     # tsc --noEmit
 pnpm run test:pre-pr   # typecheck + test (run before opening a PR)
 pnpm run dev           # local dev server on :3000 (tsx watch)
