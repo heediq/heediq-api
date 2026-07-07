@@ -11,6 +11,7 @@ import {
   confirmSignUp,
   adminSetUserPassword,
   adminLinkProviderForUser,
+  adminDeleteUser,
   listUsersByEmail,
   isExternalProviderUser,
   getProviderContext,
@@ -63,6 +64,54 @@ async function recordAuthMethodAndAudit(accountId: string, username: string) {
   })).catch((err: unknown) => {
     if (!isAwsError(err) || err.name !== 'ConditionalCheckFailedException') throw err
   })
+}
+
+async function isPasswordSetForEmail(email: string): Promise<boolean> {
+  const result = await dynamo.send(new QueryCommand({
+    TableName: config.dynamo.usersTable,
+    IndexName: 'by-email',
+    KeyConditionExpression: 'email = :email',
+    ExpressionAttributeValues: { ':email': email },
+    Limit: 1,
+  }))
+  const item = result.Items?.[0]
+  if (!item) return false
+  return UserSchema.parse(item).passwordSet === true
+}
+
+// A native Cognito user already exists for this email — either mid-flow (UNCONFIRMED, just
+// needs a fresh code) or stuck CONFIRMED-but-never-linked (D-096: the code was verified via
+// /link/verify-otp but /link/confirm's AdminSetUserPassword never ran, e.g. the user abandoned
+// the flow between D-089's two screens). Cognito refuses to ever resend a code to a CONFIRMED
+// user, so a stuck account has no self-service way back in — heal it by deleting the orphaned
+// native user and re-running SignUp so a fresh code goes out. A CONFIRMED user whose password
+// *is* set is a real, already-linked account — left untouched, same non-disclosing fallback as
+// before. Returns true if the caller should respond RATE_LIMITED.
+async function handleExistingNativeUser(email: string, requestId: string | undefined): Promise<boolean> {
+  const users = await listUsersByEmail(email)
+  const nativeUser = users.find((u) => !isExternalProviderUser(u))
+  const stuck = nativeUser?.UserStatus === 'CONFIRMED' && !(await isPasswordSetForEmail(email))
+
+  if (stuck && nativeUser?.Username) {
+    logger.warn('Healing stuck confirmed-but-unlinked native user', { requestId })
+    await adminDeleteUser(nativeUser.Username)
+    try {
+      await signUp(email, randomPassword())
+    } catch (err: unknown) {
+      if (isAwsError(err) && err.name === 'LimitExceededException') return true
+      throw err
+    }
+    return false
+  }
+
+  try {
+    await resendConfirmationCode(email)
+  } catch (resendErr: unknown) {
+    if (isAwsError(resendErr) && resendErr.name === 'LimitExceededException') return true
+    // Swallow other resend failures too (e.g. already CONFIRMED with password set — a real
+    // existing account, D-078 non-disclosure) — still respond success.
+  }
+  return false
 }
 
 // POST /api/v1/auth/lookup-email — unauthenticated (D-078). Drives the unified sign-in
@@ -121,19 +170,14 @@ auth.post('/link/request-otp', async (c) => {
       logger.warn('OTP request rate-limited', { requestId: c.get('requestId') })
       return apiError(c, 'RATE_LIMITED', 'Too many attempts — try again shortly')
     }
-    // A native Cognito user already exists (e.g. mid-confirmation, or already fully set up) —
-    // fall through to resending the existing code rather than erroring, so the response shape
-    // never differs based on account state.
+    // A native Cognito user already exists (e.g. mid-confirmation, already fully set up, or
+    // stuck confirmed-but-never-linked per D-096) — fall through to handleExistingNativeUser
+    // rather than erroring, so the response shape never differs based on account state.
     if (err.name === 'UsernameExistsException' || err.name === 'InvalidParameterException' || err.name === 'AliasExistsException') {
-      try {
-        await resendConfirmationCode(email)
-      } catch (resendErr: unknown) {
-        if (isAwsError(resendErr) && resendErr.name === 'LimitExceededException') {
-          logger.warn('OTP resend rate-limited', { requestId: c.get('requestId') })
-          return apiError(c, 'RATE_LIMITED', 'Too many attempts — try again shortly')
-        }
-        // Swallow other resend failures too (e.g. already CONFIRMED, nothing to resend) —
-        // still respond success to avoid leaking account state.
+      const rateLimited = await handleExistingNativeUser(email, c.get('requestId'))
+      if (rateLimited) {
+        logger.warn('OTP resend rate-limited', { requestId: c.get('requestId') })
+        return apiError(c, 'RATE_LIMITED', 'Too many attempts — try again shortly')
       }
     }
   }
