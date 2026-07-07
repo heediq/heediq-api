@@ -32,7 +32,12 @@ export const authMiddleware = createMiddleware<AuthContext>(async (c, next) => {
       issuer: `https://cognito-idp.${config.cognito.region}.amazonaws.com/${config.cognito.userPoolId}`,
     })
 
-    const userId = payload['sub'] as string | undefined
+    // userId is the app-owned accountId (D-099), never the raw Cognito `sub` — `sub` can be
+    // repointed onto a different Cognito user by AdminLinkProviderForUser during account linking,
+    // so it cannot be trusted as a stable identity key. auth-provision.ts emits `custom:accountId`
+    // on every token; if it's missing, the token predates D-099 or was minted before first login
+    // could provision it, so we reject rather than fall back to `sub`.
+    const userId = payload['custom:accountId'] as string | undefined
     const orgId = payload['custom:orgId'] as string | undefined
     const email = payload['email'] as string | undefined
     const role = payload['custom:role'] as OrgRole | undefined

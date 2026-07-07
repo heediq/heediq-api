@@ -23,6 +23,7 @@ vi.mock('../config.js', () => ({
       userAuthMethodsTable: 'heediq-user-auth-methods',
       authAuditLogTable: 'heediq-auth-audit-log',
       rateLimitsTable: 'heediq-rate-limits',
+      cognitoIdentitiesTable: 'heediq-cognito-identities',
     },
     s3: { audioBucket: 'heediq-audio', presignedUrlExpiresIn: 900 },
     sqs: { transcriptionQueueUrl: 'https://sqs/transcription', summarizationQueueUrl: 'https://sqs/summarization' },
@@ -319,7 +320,11 @@ describe('POST /auth/link/confirm (D-087, D-089)', () => {
     ])
     mockAdminSetUserPassword.mockResolvedValueOnce({})
     mockAdminLinkProviderForUser.mockResolvedValueOnce({})
-    mockDynamoSend.mockResolvedValue({ Items: [{ userId: 'native-sub' }] })
+    // Get on the identities table (no mapping yet) -> falls back to the by-email Query.
+    mockDynamoSend
+      .mockResolvedValueOnce({ Item: undefined }) // resolveAccountIdBySub: Get identities table
+      .mockResolvedValueOnce({ Items: [{ userId: 'native-sub' }] }) // resolveAccountIdByEmail: Query by-email
+      .mockResolvedValue({}) // linkIdentity Put, method Put, audit Put, passwordSet Update
 
     const res = await app.request('/link/confirm', {
       method: 'POST',
@@ -330,6 +335,36 @@ describe('POST /auth/link/confirm (D-087, D-089)', () => {
     const body = await res.json() as { data: { passwordSet: boolean } }
     expect(body.data).toEqual({ passwordSet: true })
     expect(mockAdminLinkProviderForUser).toHaveBeenCalledWith('a@b.com', 'Google', 'g1')
+
+    // linkIdentity pins the native sub to the resolved canonical accountId (D-099) before
+    // recordAuthMethodAndAudit writes under that same accountId.
+    const linkPut = mockDynamoSend.mock.calls[2]?.[0] as { input: { TableName: string; Item: Record<string, unknown> } }
+    expect(linkPut.input.TableName).toBe('heediq-cognito-identities')
+    expect(linkPut.input.Item).toMatchObject({ sub: 'native-sub', accountId: 'native-sub' })
+  })
+
+  it('resolves the canonical accountId via the identities table when a mapping already exists, skipping the email guess', async () => {
+    mockListUsersByEmail.mockResolvedValueOnce([
+      { Username: 'a@b.com', UserStatus: 'CONFIRMED', sub: 'native-sub' },
+    ])
+    mockAdminSetUserPassword.mockResolvedValueOnce({})
+    mockDynamoSend
+      .mockResolvedValueOnce({ Item: { sub: 'native-sub', accountId: 'account-1' } }) // resolveAccountIdBySub: hit
+      .mockResolvedValue({}) // linkIdentity, method, audit, passwordSet update
+
+    const res = await app.request('/link/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validBody),
+    })
+    expect(res.status).toBe(200)
+
+    const linkPut = mockDynamoSend.mock.calls[1]?.[0] as { input: { TableName: string; Item: Record<string, unknown> } }
+    expect(linkPut.input.TableName).toBe('heediq-cognito-identities')
+    expect(linkPut.input.Item).toMatchObject({ sub: 'native-sub', accountId: 'account-1' })
+
+    const methodPut = mockDynamoSend.mock.calls[2]?.[0] as { input: { Item: Record<string, unknown> } }
+    expect(methodPut.input.Item['pk']).toBe('USER#account-1')
   })
 
   it('treats InvalidParameterException on link as already-linked and continues', async () => {

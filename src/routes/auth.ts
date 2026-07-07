@@ -3,6 +3,7 @@ import type { Context } from 'hono'
 import { getConnInfo } from 'hono/aws-lambda'
 import { QueryCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb'
 import { dynamo } from '../lib/dynamo.js'
+import { resolveAccountIdBySub, resolveAccountIdByEmail, linkIdentity } from '../lib/accountIdentity.js'
 import { apiError, ok } from '../lib/errors.js'
 import { config } from '../config.js'
 import { LookupEmailRequestSchema, LinkStartRequestSchema, LinkVerifyOtpRequestSchema, LinkConfirmRequestSchema, UserSchema, createLogger } from '@heediq/shared'
@@ -29,16 +30,11 @@ function isAwsError(err: unknown): err is { name: string } {
   return typeof err === 'object' && err !== null && 'name' in err
 }
 
-async function resolveCanonicalAccountId(email: string, fallbackSub: string): Promise<string> {
-  const result = await dynamo.send(new QueryCommand({
-    TableName: config.dynamo.usersTable,
-    IndexName: 'by-email',
-    KeyConditionExpression: 'email = :email',
-    ExpressionAttributeValues: { ':email': email },
-    Limit: 1,
-  }))
-  const userId = result.Items?.[0]?.['userId'] as string | undefined
-  return userId ?? fallbackSub
+async function resolveCanonicalAccountId(sub: string, email: string, fallbackSub: string): Promise<string> {
+  const accountId =
+    (await resolveAccountIdBySub(config.dynamo.cognitoIdentitiesTable, sub)) ??
+    (await resolveAccountIdByEmail(config.dynamo.usersTable, email))
+  return accountId ?? fallbackSub
 }
 
 async function recordAuthMethodAndAudit(accountId: string, username: string) {
@@ -310,7 +306,11 @@ auth.post('/link/confirm', async (c) => {
   }
 
   const nativeSub = getUserAttribute(nativeUser, 'sub') ?? nativeUser.Username
-  const canonicalAccountId = await resolveCanonicalAccountId(email, nativeSub)
+  const canonicalAccountId = await resolveCanonicalAccountId(nativeSub, email, nativeSub)
+  // Pin the native identity to its canonical accountId now (D-099) — this is the sub every
+  // future login (native, and any provider linked above via AdminLinkProviderForUser) will
+  // present, so PreTokenGeneration resolves it deterministically instead of re-guessing by email.
+  await linkIdentity(config.dynamo.cognitoIdentitiesTable, nativeSub, canonicalAccountId)
   await recordAuthMethodAndAudit(canonicalAccountId, nativeUser.Username)
 
   logger.info('Password set and providers linked', { requestId: c.get('requestId'), accountId: canonicalAccountId })

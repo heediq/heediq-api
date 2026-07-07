@@ -1,5 +1,5 @@
 import type { PreSignUpTriggerHandler } from 'aws-lambda'
-import { QueryCommand, PutCommand } from '@aws-sdk/lib-dynamodb'
+import { PutCommand } from '@aws-sdk/lib-dynamodb'
 import {
   CognitoIdentityProviderClient,
   ListUsersCommand,
@@ -7,6 +7,7 @@ import {
   AdminLinkProviderForUserCommand,
 } from '@aws-sdk/client-cognito-identity-provider'
 import { dynamo } from '../lib/dynamo.js'
+import { resolveAccountIdByEmail } from '../lib/accountIdentity.js'
 import { createLogger } from '@heediq/shared'
 
 function requireEnv(name: string): string {
@@ -44,17 +45,6 @@ function randomTemporaryPassword(): string {
   let core = ''
   for (let i = 0; i < 20; i++) core += alphabet[Math.floor(Math.random() * alphabet.length)]
   return `Aa9!${core}`
-}
-
-async function resolveAccountIdByEmail(email: string): Promise<string | null> {
-  const result = await dynamo.send(new QueryCommand({
-    TableName: USERS_TABLE,
-    IndexName: 'by-email',
-    KeyConditionExpression: 'email = :email',
-    ExpressionAttributeValues: { ':email': email },
-    Limit: 1,
-  }))
-  return (result.Items?.[0]?.['userId'] as string | undefined) ?? null
 }
 
 async function upsertAuthMethod(accountId: string, providerName: string, providerSub: string, username: string) {
@@ -125,7 +115,7 @@ export const handler: PreSignUpTriggerHandler = async (event) => {
     throw new Error('Unable to resolve social provider identity, please try again.')
   }
 
-  const accountId = await resolveAccountIdByEmail(email)
+  const accountId = await resolveAccountIdByEmail(USERS_TABLE, email)
   let destinationUsername = await findDestinationUsername(userPoolId, email)
   if (!destinationUsername && accountId) {
     destinationUsername = await autoHealNativeUser(userPoolId, email)

@@ -11,7 +11,7 @@ All Heediq REST endpoints in a single Lambda function. Handles auth, Source CRUD
 - `src/app.ts` — Hono app: CORS, auth middleware wiring, `/api/v1/` route registration
 - `src/lambda.ts` — Lambda handler (`hono/aws-lambda`)
 - `src/config.ts` — env var config (all injected by CDK at deploy, D-038)
-- `src/middleware/auth.ts` — JWKS-based Cognito JWT validation (jose), sets `userId/orgId/email/role` on context (D-041)
+- `src/middleware/auth.ts` — JWKS-based Cognito JWT validation (jose), sets `userId/orgId/email/role` on context (D-041). `userId` is read from the `custom:accountId` claim, never `sub` (D-099) — `sub` can be repointed to a different Cognito user by `AdminLinkProviderForUser` during account linking, so it's not a stable identity key.
 - `src/middleware/request-id.ts` — correlation ID middleware (D-085): reads `X-Request-Id` from the caller or generates a UUID, sets it on context, and echoes it back as a response header
 - `src/lib/errors.ts` — `apiError()` / `ok()` response helpers with consistent envelope (D-033)
 - `src/lib/dynamo.ts` — DynamoDB Document Client singleton
@@ -20,11 +20,12 @@ All Heediq REST endpoints in a single Lambda function. Handles auth, Source CRUD
 - `src/routes/upload.ts` — `POST /api/v1/upload/presign` (S3 presigned URL)
 - `src/routes/auth.ts` — unauthenticated `/api/v1/auth` sub-app: `lookup-email` + D-087/D-089 cross-provider linking (`link/request-otp`, `link/verify-otp`, `link/confirm`)
 - `src/lib/cognito.ts` — Cognito Identity Provider SDK wrapper (`SignUp`, `ConfirmSignUp`, `ResendConfirmationCode`, `AdminSetUserPassword`, `AdminLinkProviderForUser`, `AdminDeleteUser`, `AdminCreateUser`, `ListUsers`) used by `routes/auth.ts` and the trigger handlers below
-- `src/handlers/auth-provision.ts` — Cognito PreTokenGeneration trigger (D-077): idempotent get-or-create of org+user, injects `custom:orgId`/`custom:role` claims. Resolves the existing row **by email first, falling back to `sub`** (`resolveExistingUser`) — a post-linking re-login presents the destination/native user's `sub`, not the original federated `sub`, so an email-first lookup avoids provisioning a duplicate org. No `email_verified` gate (D-090) — provisioning is unconditional on first login for any method, since D-089 makes ownership of the email Heediq's own responsibility, not an IdP-asserted claim.
-- `src/routes/auth-methods.ts` — authenticated `GET /api/v1/auth/methods` (D-091): lists the caller's active sign-in methods from `heediq-user-auth-methods`, scoped to their own `userId`
+- `src/lib/accountIdentity.ts` — shared identity-resolution helpers (D-099): `resolveAccountIdBySub` (deterministic `heediq-cognito-identities` lookup), `linkIdentity` (pins a `sub → accountId` mapping), `resolveAccountIdByEmail` (fallback-only self-heal via the `by-email` GSI, provisional until pinned). Used by every auth handler/route below instead of each duplicating its own lookup.
+- `src/handlers/auth-provision.ts` — Cognito PreTokenGeneration trigger (D-077/D-099): resolves `accountId` via `heediq-cognito-identities` first (deterministic); falls back to the `by-email` self-heal, pinning the mapping via `linkIdentity` for future logins; on a genuinely first login, generates a new app-owned `accountId` (`randomUUID`, decoupled from `sub`) and writes org + user + identity mapping + initial auth-method + audit entries in one `Promise.all`. Always emits `custom:accountId`/`custom:orgId`/`custom:role` claims. No `email_verified` gate (D-090) — provisioning is unconditional on first login for any method, since D-089 makes ownership of the email Heediq's own responsibility, not an IdP-asserted claim.
+- `src/routes/auth-methods.ts` — authenticated `GET /api/v1/auth/methods` (D-091): lists the caller's active sign-in methods from `heediq-user-auth-methods`, scoped to their own `userId` (the `custom:accountId`-derived value, D-099)
 - `src/handlers/auth-trigger-pre-signup.ts` — Cognito PreSignUp trigger (`PreSignUp_ExternalProvider` only): links a new federated login onto a matching native account by email
-- `src/handlers/auth-trigger-post-confirmation.ts` — Cognito PostConfirmation trigger (`PostConfirmation_ConfirmSignUp` only): records the auth method + audit event; does NOT write the main `users` row (that's `auth-provision.ts`'s job, lazily at first login)
-- `src/handlers/auth-trigger-post-authentication.ts` — Cognito PostAuthentication trigger (`PostAuthentication_Authentication` only): records the auth method for the login just completed and auto-links a federated login to an existing native account with the same email if not yet linked
+- `src/handlers/auth-trigger-post-confirmation.ts` — Cognito PostConfirmation trigger (`PostConfirmation_ConfirmSignUp` only): records the auth method + audit event only when an existing `accountId` can be positively resolved (identities table, then email self-heal). Fires before `auth-provision.ts`, so a genuinely new signup has no `accountId` yet (D-099) — rather than guess one, it skips the write entirely and defers the initial auth-method/audit entry to `auth-provision.ts`'s first-login branch.
+- `src/handlers/auth-trigger-post-authentication.ts` — Cognito PostAuthentication trigger (`PostAuthentication_Authentication` only): resolves the canonical `accountId` the same way `auth-provision.ts` will moments later (identities table first, D-099), records the auth method for the login just completed, self-heals by pinning an unresolved `sub` via `linkIdentity`, and auto-links a federated login to an existing native account with the same email if not yet linked
 
 ## Data Flow
 
@@ -78,6 +79,15 @@ non-disclosure guarantee from D-078. The window boundary is baked into the parti
 storage cleanup only, not correctness (DynamoDB TTL deletion isn't immediately timed). A prod-only
 WAF rate-based rule is scaffolded in `heediq-infra` but shipped disabled until a marketing campaign
 is planned (D-098) — see `heediq-infra/README.md`'s ApiStack section.
+
+**D-099 accountId identity (Cognito ↔ DynamoDB contract):** `heediq-cognito-identities` (pk = `sub`,
+attribute = `accountId`) is the deterministic map from every Cognito identity (native or federated) a
+person has ever logged in with onto one app-owned `accountId`. Every JWT issued by Cognito carries
+`custom:accountId` (set only by `auth-provision.ts`), and every part of this API — `middleware/auth.ts`
+included — treats that claim, not `sub`, as the identity key. The `by-email` GSI on `heediq-users` is
+now a fallback-only self-heal path for identities that predate this table or arrive freshly repointed
+by `AdminLinkProviderForUser`; any resolution via email immediately pins a `sub → accountId` row so
+future logins take the deterministic path.
 
 **D-091 active methods:** `heediq-user-auth-methods` is the authoritative source of truth for which
 methods are active on an account — `GET /auth/methods` is a straight `Query` on `pk = USER#<userId>`,
@@ -135,3 +145,4 @@ Integration tests (Vitest + DynamoDB Local) — to be added once the integration
 - **`labels: []` set explicitly on create:** the `Source` object built in `POST /sources` is written directly via `PutCommand`, bypassing `SourceSchema.parse()`, so the schema's `labels` default (`[]`) is set explicitly in code to match what a read-back `.parse()` would produce.
 - **Deploy:** CI builds via `pnpm run bundle` (esbuild) and runs `aws lambda update-function-code` per environment, gated by the D-070/D-071 org-level `vars.AWS_REGION` / `vars.DEPLOY_ROLE_ARN`. See `heediq-infra/README.md` §"Initial Setup" for CDK-bootstrap prerequisites (Lambda + API Gateway must be deployed by CDK before this repo's CI can update function code).
 - **The 3 `auth-trigger-*.ts` handlers are separate bundled Lambda entry points**, not part of the main API Lambda — each has its own `bundle:auth-trigger-*` esbuild script and its own deploy step in `deploy.yml` per environment, same pattern as `auth-provision.ts`.
+- **`custom:accountId` (D-099) required a full Cognito User Pool replacement:** adding a custom attribute changes the User Pool's `Schema`, which CloudFormation can only apply via full resource replacement — this destroys all existing users in whichever environment it's deployed to. Confirmed and accepted for dev; requires explicit sign-off before staging/prod (existing users would need to re-sign-up).
