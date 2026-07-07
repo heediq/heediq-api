@@ -277,7 +277,7 @@ describe('POST /auth/link/verify-otp (D-089)', () => {
 describe('POST /auth/link/confirm (D-087, D-089)', () => {
   beforeEach(() => { vi.clearAllMocks() })
 
-  const validBody = { email: 'a@b.com', newPassword: 'password123' }
+  const validBody = { email: 'a@b.com', newPassword: 'Password123!' }
 
   it('rejects an invalid request body', async () => {
     const res = await app.request('/link/confirm', {
@@ -286,6 +286,21 @@ describe('POST /auth/link/confirm (D-087, D-089)', () => {
       body: JSON.stringify({ email: 'a@b.com', newPassword: 'short' }),
     })
     expect(res.status).toBe(400)
+  })
+
+  it('returns WEAK_PASSWORD without calling Cognito when the password fails the shared policy pre-check (D-094)', async () => {
+    const res = await app.request('/link/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // 8+ chars so it clears the schema's minLength, but no uppercase/symbol so it fails
+      // @heediq/shared's PASSWORD_POLICY_RULES.
+      body: JSON.stringify({ email: 'a@b.com', newPassword: 'password123' }),
+    })
+    expect(res.status).toBe(400)
+    const body = await res.json() as { error: { code: string } }
+    expect(body.error.code).toBe('WEAK_PASSWORD')
+    expect(mockListUsersByEmail).not.toHaveBeenCalled()
+    expect(mockAdminSetUserPassword).not.toHaveBeenCalled()
   })
 
   it('returns 400 when no native user exists to attach the password to', async () => {
@@ -299,7 +314,7 @@ describe('POST /auth/link/confirm (D-087, D-089)', () => {
     expect(res.status).toBe(400)
   })
 
-  it('returns WEAK_PASSWORD when Cognito rejects the password on policy grounds', async () => {
+  it('returns WEAK_PASSWORD when Cognito rejects a policy-compliant password anyway (e.g. password-history reuse)', async () => {
     mockListUsersByEmail.mockResolvedValueOnce([{ Username: 'a@b.com', UserStatus: 'CONFIRMED', sub: 'native-sub' }])
     mockAdminSetUserPassword.mockRejectedValueOnce(awsError('InvalidPasswordException'))
 

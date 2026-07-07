@@ -6,7 +6,7 @@ import { dynamo } from '../lib/dynamo.js'
 import { resolveAccountIdBySub, resolveAccountIdByEmail, linkIdentity } from '../lib/accountIdentity.js'
 import { apiError, ok } from '../lib/errors.js'
 import { config } from '../config.js'
-import { LookupEmailRequestSchema, LinkStartRequestSchema, LinkVerifyOtpRequestSchema, LinkConfirmRequestSchema, UserSchema, createLogger } from '@heediq/shared'
+import { LookupEmailRequestSchema, LinkStartRequestSchema, LinkVerifyOtpRequestSchema, LinkConfirmRequestSchema, UserSchema, createLogger, isPasswordPolicyCompliant } from '@heediq/shared'
 import type { RequestIdContext } from '../middleware/request-id.js'
 import { checkRateLimit } from '../lib/rateLimit.js'
 import {
@@ -267,6 +267,14 @@ auth.post('/link/confirm', async (c) => {
     return apiError(c, 'BAD_REQUEST', 'Invalid request body', parsed.error.flatten())
   }
   const { email, newPassword } = parsed.data
+
+  // Pre-check against the shared policy (D-094) so an obviously-weak password is rejected
+  // without a round trip to Cognito — the frontend already runs the same check live, but the
+  // server can't trust that, so it re-checks before any Cognito call.
+  if (!isPasswordPolicyCompliant(newPassword)) {
+    logger.warn('Password link rejected — weak password (pre-check)', { requestId: c.get('requestId') })
+    return apiError(c, 'WEAK_PASSWORD', 'Password does not meet the requirements')
+  }
 
   const users = await listUsersByEmail(email)
   const nativeUser = users.find((u) => !isExternalProviderUser(u))
