@@ -7,6 +7,7 @@ import {
   AdminSetUserPasswordCommand,
   AdminLinkProviderForUserCommand,
   AdminCreateUserCommand,
+  AdminDeleteUserCommand,
   ListUsersCommand,
   type UserType,
 } from '@aws-sdk/client-cognito-identity-provider'
@@ -61,6 +62,15 @@ export function adminLinkProviderForUser(nativeUsername: string, providerName: s
       ProviderAttributeName: 'Cognito_Subject',
       ProviderAttributeValue: providerUserId,
     },
+  }))
+}
+
+// Removes a native user stuck CONFIRMED-but-never-linked (D-096) — Cognito refuses to ever
+// resend a code to a CONFIRMED user, so this is the only way back to a fresh SignUp.
+export function adminDeleteUser(username: string) {
+  return cognitoClient.send(new AdminDeleteUserCommand({
+    UserPoolId: config.cognito.userPoolId,
+    Username: username,
   }))
 }
 

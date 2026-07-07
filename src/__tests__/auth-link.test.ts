@@ -7,6 +7,7 @@ const mockResendConfirmationCode = vi.hoisted(() => vi.fn())
 const mockConfirmSignUp = vi.hoisted(() => vi.fn())
 const mockAdminSetUserPassword = vi.hoisted(() => vi.fn())
 const mockAdminLinkProviderForUser = vi.hoisted(() => vi.fn())
+const mockAdminDeleteUser = vi.hoisted(() => vi.fn())
 const mockListUsersByEmail = vi.hoisted(() => vi.fn())
 
 vi.mock('../config.js', () => ({
@@ -35,6 +36,7 @@ vi.mock('../lib/cognito.js', () => ({
   confirmSignUp: mockConfirmSignUp,
   adminSetUserPassword: mockAdminSetUserPassword,
   adminLinkProviderForUser: mockAdminLinkProviderForUser,
+  adminDeleteUser: mockAdminDeleteUser,
   listUsersByEmail: mockListUsersByEmail,
   isExternalProviderUser: (u: { UserStatus?: string }) => u.UserStatus === 'EXTERNAL_PROVIDER',
   getProviderContext: (u: { identities?: { providerName: string; providerUserId: string }[] }) =>
@@ -80,8 +82,9 @@ describe('POST /auth/link/request-otp (D-087)', () => {
     expect(mockResendConfirmationCode).not.toHaveBeenCalled()
   })
 
-  it('falls through to resend when the user already exists mid-flow', async () => {
+  it('falls through to resend when the user already exists mid-flow (UNCONFIRMED)', async () => {
     mockSignUp.mockRejectedValueOnce(awsError('UsernameExistsException'))
+    mockListUsersByEmail.mockResolvedValueOnce([{ Username: 'existing@b.com', UserStatus: 'UNCONFIRMED' }])
     mockResendConfirmationCode.mockResolvedValueOnce({})
     const res = await app.request('/link/request-otp', {
       method: 'POST',
@@ -90,6 +93,7 @@ describe('POST /auth/link/request-otp (D-087)', () => {
     })
     expect(res.status).toBe(200)
     expect(mockResendConfirmationCode).toHaveBeenCalledWith('existing@b.com')
+    expect(mockAdminDeleteUser).not.toHaveBeenCalled()
   })
 
   it('returns 429 when SignUp is rate-limited', async () => {
@@ -104,6 +108,7 @@ describe('POST /auth/link/request-otp (D-087)', () => {
 
   it('returns 429 when the resend fallback is rate-limited', async () => {
     mockSignUp.mockRejectedValueOnce(awsError('UsernameExistsException'))
+    mockListUsersByEmail.mockResolvedValueOnce([])
     mockResendConfirmationCode.mockRejectedValueOnce(awsError('LimitExceededException'))
     const res = await app.request('/link/request-otp', {
       method: 'POST',
@@ -115,6 +120,7 @@ describe('POST /auth/link/request-otp (D-087)', () => {
 
   it('still returns success when resend fails for a benign reason', async () => {
     mockSignUp.mockRejectedValueOnce(awsError('UsernameExistsException'))
+    mockListUsersByEmail.mockResolvedValueOnce([])
     mockResendConfirmationCode.mockRejectedValueOnce(awsError('NotAuthorizedException'))
     const res = await app.request('/link/request-otp', {
       method: 'POST',
@@ -122,6 +128,56 @@ describe('POST /auth/link/request-otp (D-087)', () => {
       body: JSON.stringify({ email: 'a@b.com' }),
     })
     expect(res.status).toBe(200)
+  })
+
+  // D-096: a user who verified the code but abandoned before setting a password is left as a
+  // native Cognito user stuck CONFIRMED with no password — Cognito refuses to resend a code to
+  // a CONFIRMED user, so without this heal the account would be unrecoverable via self-service.
+  it('heals a stuck confirmed-but-unlinked native user by deleting and re-signing-up', async () => {
+    mockSignUp.mockRejectedValueOnce(awsError('UsernameExistsException'))
+    mockListUsersByEmail.mockResolvedValueOnce([{ Username: 'stuck-sub', UserStatus: 'CONFIRMED' }])
+    mockDynamoSend.mockResolvedValueOnce({ Items: [] }) // no passwordSet=true row — never linked
+    mockSignUp.mockResolvedValueOnce({}) // fresh SignUp after the heal
+
+    const res = await app.request('/link/request-otp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'stuck@b.com' }),
+    })
+    expect(res.status).toBe(200)
+    expect(mockAdminDeleteUser).toHaveBeenCalledWith('stuck-sub')
+    expect(mockSignUp).toHaveBeenCalledTimes(2)
+    expect(mockResendConfirmationCode).not.toHaveBeenCalled()
+  })
+
+  it('does not heal a real already-linked account (passwordSet true)', async () => {
+    mockSignUp.mockRejectedValueOnce(awsError('UsernameExistsException'))
+    mockListUsersByEmail.mockResolvedValueOnce([{ Username: 'linked-sub', UserStatus: 'CONFIRMED' }])
+    mockDynamoSend.mockResolvedValueOnce({ Items: [{ userId: 'linked-sub', email: 'linked@b.com', passwordSet: true, orgId: '11111111-1111-4111-8111-111111111111', role: 'member', createdAt: '2026-01-01T00:00:00.000Z' }] })
+    mockResendConfirmationCode.mockRejectedValueOnce(awsError('InvalidParameterException'))
+
+    const res = await app.request('/link/request-otp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'linked@b.com' }),
+    })
+    expect(res.status).toBe(200)
+    expect(mockAdminDeleteUser).not.toHaveBeenCalled()
+    expect(mockResendConfirmationCode).toHaveBeenCalledWith('linked@b.com')
+  })
+
+  it('returns 429 when the post-heal SignUp is rate-limited', async () => {
+    mockSignUp.mockRejectedValueOnce(awsError('UsernameExistsException'))
+    mockListUsersByEmail.mockResolvedValueOnce([{ Username: 'stuck-sub', UserStatus: 'CONFIRMED' }])
+    mockDynamoSend.mockResolvedValueOnce({ Items: [] })
+    mockSignUp.mockRejectedValueOnce(awsError('LimitExceededException'))
+
+    const res = await app.request('/link/request-otp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'stuck@b.com' }),
+    })
+    expect(res.status).toBe(429)
   })
 })
 
