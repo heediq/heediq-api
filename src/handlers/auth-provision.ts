@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import type { PreTokenGenerationTriggerHandler } from 'aws-lambda'
-import { GetCommand, PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb'
+import { GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb'
 import { dynamo } from '../lib/dynamo.js'
+import { resolveAccountIdBySub, resolveAccountIdByEmail, linkIdentity } from '../lib/accountIdentity.js'
 import { createLogger, type OrgRole } from '@heediq/shared'
 
 // Separate Lambda entry point (own env vars, not the full API config) — this fires on every
@@ -14,69 +15,152 @@ function requireEnv(name: string): string {
 
 const ORGS_TABLE = requireEnv('ORGS_TABLE_NAME')
 const USERS_TABLE = requireEnv('USERS_TABLE_NAME')
+const IDENTITIES_TABLE = requireEnv('COGNITO_IDENTITIES_TABLE_NAME')
+const USER_AUTH_METHODS_TABLE = requireEnv('USER_AUTH_METHODS_TABLE_NAME')
+const AUTH_AUDIT_LOG_TABLE = requireEnv('AUTH_AUDIT_LOG_TABLE_NAME')
 const logger = createLogger('heediq-api')
 
+function providerFromIdentitiesAttr(raw: string | undefined): { providerName: string; providerSub: string } | null {
+  if (!raw) return null
+  let identities: unknown
+  try {
+    identities = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (!Array.isArray(identities) || identities.length === 0) return null
+  const first = identities[0] as { providerName?: unknown; userId?: unknown }
+  if (typeof first.providerName === 'string' && typeof first.userId === 'string') {
+    return { providerName: first.providerName, providerSub: first.userId }
+  }
+  return null
+}
+
 export const handler: PreTokenGenerationTriggerHandler = async (event) => {
-  const userId = event.request.userAttributes['sub']
+  const sub = event.request.userAttributes['sub']
   const email = event.request.userAttributes['email']?.trim().toLowerCase()
 
-  // Resolve the canonical row by email first, not by sub (D-090). After AdminLinkProviderForUser
-  // links a federated identity to a native user (D-089), that identity's subsequent logins present
-  // the native user's sub, not the sub that originally created this row — a sub-only lookup would
-  // miss and re-provision a duplicate org for the same email.
-  const existing = await resolveExistingUser(userId, email)
+  // Deterministic path (D-099): every sub this identity has ever logged in with is mapped to
+  // one accountId once, up front — no re-guessing on every login.
+  let accountId = await resolveAccountIdBySub(IDENTITIES_TABLE, sub)
 
-  if (!existing) {
-    // First login for this identity (native or federated — PreTokenGeneration fires for both,
-    // unlike PostConfirmation, D-077). Provisions a brand-new org with this user as admin.
-    // D-020's email-domain "request to join" flow is not yet built — every first-time user
-    // gets their own org rather than joining one matching their email domain.
-    const orgId = randomUUID()
-    const role: OrgRole = 'admin'
-    const now = new Date().toISOString()
-    const emailDomain = email.split('@')[1] ?? ''
-
-    await Promise.all([
-      dynamo.send(new PutCommand({
-        TableName: ORGS_TABLE,
-        Item: {
-          orgId,
-          name: email.split('@')[0],
-          plan: 'free',
-          seatCount: 1,
-          usageLifetimeCount: 0,
-          emailDomain,
-          createdAt: now,
+  if (accountId) {
+    const user = await dynamo.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId: accountId } }))
+    if (user.Item) {
+      logger.info('Existing user resolved via identities table', { sub, accountId })
+      event.response = {
+        claimsOverrideDetails: {
+          claimsToAddOrOverride: {
+            'custom:accountId': accountId,
+            'custom:orgId': user.Item['orgId'] as string,
+            'custom:role': user.Item['role'] as OrgRole,
+          },
         },
-      })),
-      dynamo.send(new PutCommand({
-        TableName: USERS_TABLE,
-        // passwordSet tracks whether this identity has a Cognito password credential — this
-        // Lambda only ever fires for logins that already succeeded, so a federated-only login
-        // here has no password yet; a native email/password signup does (D-078).
-        Item: { userId, orgId, email, role, passwordSet: !isFederatedLogin(event), createdAt: now },
-      })),
-    ])
-
-    logger.info('New org provisioned at first login', { userId, orgId, federated: isFederatedLogin(event) })
-    event.response = {
-      claimsOverrideDetails: {
-        claimsToAddOrOverride: { 'custom:orgId': orgId, 'custom:role': role },
-      },
+      }
+      return event
     }
-    return event
+    // Mapping existed but the user row is gone — fall through and self-heal below.
+    accountId = undefined
   }
 
-  logger.info('Existing user resolved at login', { userId, orgId: existing['orgId'] })
+  // Self-heal (D-090): no identity mapping yet, e.g. a sub that logged in before D-099, or a
+  // sub freshly repointed by AdminLinkProviderForUser onto an account it hasn't mapped yet.
+  // The email guess is provisional — resolving it pins a definitive mapping for this sub below
+  // so every subsequent login for this sub takes the deterministic path.
+  const existingAccountId = await resolveAccountIdByEmail(USERS_TABLE, email)
+
+  if (existingAccountId) {
+    const user = await dynamo.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId: existingAccountId } }))
+    if (user.Item) {
+      await linkIdentity(IDENTITIES_TABLE, sub, existingAccountId)
+      logger.info('Existing user resolved and identity linked via email self-heal', { sub, accountId: existingAccountId })
+      event.response = {
+        claimsOverrideDetails: {
+          claimsToAddOrOverride: {
+            'custom:accountId': existingAccountId,
+            'custom:orgId': user.Item['orgId'] as string,
+            'custom:role': user.Item['role'] as OrgRole,
+          },
+        },
+      }
+      return event
+    }
+  }
+
+  // Genuinely first login for this email (native or federated — PreTokenGeneration fires for
+  // both, unlike PostConfirmation, D-077). Provisions a brand-new org with this user as admin,
+  // a new app-owned accountId (D-099), and the first identity mapping for it.
+  // D-020's email-domain "request to join" flow is not yet built — every first-time user gets
+  // their own org rather than joining one matching their email domain.
+  const newAccountId = randomUUID()
+  const orgId = randomUUID()
+  const role: OrgRole = 'admin'
+  const now = new Date().toISOString()
+  const emailDomain = email.split('@')[1] ?? ''
+
+  // The first auth method + audit entry are recorded here, not in the PostConfirmation trigger
+  // (auth-trigger-post-confirmation.ts): PostConfirmation fires before this accountId exists, so
+  // under D-099's decoupled accountId it can no longer guess the right key to write under.
+  const providerContext = providerFromIdentitiesAttr(event.request.userAttributes['identities'])
+  const providerName = providerContext?.providerName ?? 'COGNITO'
+  const providerSub = providerContext?.providerSub ?? sub
+
+  await Promise.all([
+    dynamo.send(new PutCommand({
+      TableName: ORGS_TABLE,
+      Item: {
+        orgId,
+        name: email.split('@')[0],
+        plan: 'free',
+        seatCount: 1,
+        usageLifetimeCount: 0,
+        emailDomain,
+        createdAt: now,
+      },
+    })),
+    dynamo.send(new PutCommand({
+      TableName: USERS_TABLE,
+      // passwordSet tracks whether this identity has a Cognito password credential — this
+      // Lambda only ever fires for logins that already succeeded, so a federated-only login
+      // here has no password yet; a native email/password signup does (D-078).
+      Item: { userId: newAccountId, orgId, email, role, passwordSet: !isFederatedLogin(event), createdAt: now },
+    })),
+    linkIdentity(IDENTITIES_TABLE, sub, newAccountId),
+    dynamo.send(new PutCommand({
+      TableName: USER_AUTH_METHODS_TABLE,
+      Item: {
+        pk: `USER#${newAccountId}`,
+        sk: `METHOD#${providerName.toUpperCase()}`,
+        provider: providerName,
+        providerSub,
+        linkedAt: now,
+        verified: true,
+        username: sub,
+      },
+    })),
+    dynamo.send(new PutCommand({
+      TableName: AUTH_AUDIT_LOG_TABLE,
+      Item: {
+        pk: `USER#${newAccountId}`,
+        sk: `EVENT#${now}`,
+        action: 'FIRST_LOGIN_PROVISIONED',
+        provider: providerName,
+        createdAt: now,
+        details: 'New org and account provisioned at first login',
+      },
+    })),
+  ])
+
+  logger.info('New org provisioned at first login', { sub, accountId: newAccountId, orgId, federated: isFederatedLogin(event) })
   event.response = {
     claimsOverrideDetails: {
       claimsToAddOrOverride: {
-        'custom:orgId': existing['orgId'] as string,
-        'custom:role': existing['role'] as OrgRole,
+        'custom:accountId': newAccountId,
+        'custom:orgId': orgId,
+        'custom:role': role,
       },
     },
   }
-
   return event
 }
 
@@ -85,21 +169,4 @@ export const handler: PreTokenGenerationTriggerHandler = async (event) => {
 // without needing to inspect Client Metadata or the trigger source.
 function isFederatedLogin(event: Parameters<PreTokenGenerationTriggerHandler>[0]): boolean {
   return event.request.userAttributes['identities'] !== undefined
-}
-
-async function resolveExistingUser(
-  userId: string,
-  email: string,
-): Promise<Record<string, unknown> | undefined> {
-  const byEmail = await dynamo.send(new QueryCommand({
-    TableName: USERS_TABLE,
-    IndexName: 'by-email',
-    KeyConditionExpression: 'email = :email',
-    ExpressionAttributeValues: { ':email': email },
-    Limit: 1,
-  }))
-  if (byEmail.Items?.[0]) return byEmail.Items[0]
-
-  const bySub = await dynamo.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId } }))
-  return bySub.Item
 }

@@ -3,6 +3,9 @@ import type { PreTokenGenerationTriggerEvent } from 'aws-lambda'
 
 process.env['ORGS_TABLE_NAME'] = 'heediq-orgs'
 process.env['USERS_TABLE_NAME'] = 'heediq-users'
+process.env['COGNITO_IDENTITIES_TABLE_NAME'] = 'heediq-cognito-identities'
+process.env['USER_AUTH_METHODS_TABLE_NAME'] = 'heediq-user-auth-methods'
+process.env['AUTH_AUDIT_LOG_TABLE_NAME'] = 'heediq-auth-audit-log'
 
 const send = vi.fn()
 vi.mock('../lib/dynamo.js', () => ({ dynamo: { send: (...args: unknown[]) => send(...args) } }))
@@ -21,23 +24,27 @@ function baseEvent(overrides: Record<string, string> = {}): PreTokenGenerationTr
 describe('auth-provision handler', () => {
   beforeEach(() => { send.mockReset() })
 
-  it('injects existing claims without writing when the user already has an org (found by email)', async () => {
-    send.mockResolvedValueOnce({ Items: [{ userId: 'user-1', orgId: 'org-1', role: 'member' }] }) // Query by-email
+  it('resolves via the identities table and returns claims with a single lookup', async () => {
+    send
+      .mockResolvedValueOnce({ Item: { sub: 'user-1', accountId: 'account-1' } }) // Get identities table
+      .mockResolvedValueOnce({ Item: { userId: 'account-1', orgId: 'org-1', role: 'member' } }) // Get user
 
     const result = await handler(baseEvent(), {} as never, () => undefined) as PreTokenGenerationTriggerEvent
 
-    expect(send).toHaveBeenCalledTimes(1) // only the Query, no Get, no Puts
+    expect(send).toHaveBeenCalledTimes(2)
     expect(result.response.claimsOverrideDetails?.claimsToAddOrOverride).toEqual({
+      'custom:accountId': 'account-1',
       'custom:orgId': 'org-1',
       'custom:role': 'member',
     })
   })
 
-  it('resolves the existing row by a different sub than the current login (D-090 — post-linking re-login)', async () => {
-    // Simulates a Google login AFTER AdminLinkProviderForUser has linked it to a native user:
-    // the token's sub ("native-user-uuid") differs from the sub that originally created the row
-    // ("user-1"), but the email-first lookup must still resolve to the same org — no duplicate.
-    send.mockResolvedValueOnce({ Items: [{ userId: 'user-1', orgId: 'org-1', role: 'admin' }] })
+  it('self-heals via email lookup when the identities table has no mapping and pins the mapping via linkIdentity', async () => {
+    send
+      .mockResolvedValueOnce({ Item: undefined }) // Get identities table: no mapping
+      .mockResolvedValueOnce({ Items: [{ userId: 'account-1', email: 'ada@acme.com' }] }) // Query by-email
+      .mockResolvedValueOnce({ Item: { userId: 'account-1', orgId: 'org-1', role: 'admin' } }) // Get user
+      .mockResolvedValueOnce({}) // Put linkIdentity
 
     const result = await handler(
       baseEvent({ sub: 'native-user-uuid' }),
@@ -45,46 +52,47 @@ describe('auth-provision handler', () => {
       () => undefined,
     ) as PreTokenGenerationTriggerEvent
 
-    expect(send).toHaveBeenCalledTimes(1) // resolved by email — no Get fallback, no re-provisioning
+    expect(send).toHaveBeenCalledTimes(4)
+    const linkPut = send.mock.calls[3]?.[0] as { input: { TableName: string; Item: Record<string, unknown> } }
+    expect(linkPut.input.TableName).toBe('heediq-cognito-identities')
+    expect(linkPut.input.Item).toMatchObject({ sub: 'native-user-uuid', accountId: 'account-1' })
     expect(result.response.claimsOverrideDetails?.claimsToAddOrOverride).toEqual({
+      'custom:accountId': 'account-1',
       'custom:orgId': 'org-1',
       'custom:role': 'admin',
     })
   })
 
-  it('falls back to a sub-keyed Get when no row matches the email (defensive path)', async () => {
+  it('provisions a new org, admin user, and identity mapping on first login', async () => {
     send
+      .mockResolvedValueOnce({ Item: undefined }) // Get identities table: no mapping
       .mockResolvedValueOnce({ Items: [] }) // Query by-email: no match
-      .mockResolvedValueOnce({ Item: { userId: 'user-1', orgId: 'org-1', role: 'member' } }) // Get by sub: match
-
-    const result = await handler(baseEvent(), {} as never, () => undefined) as PreTokenGenerationTriggerEvent
-
-    expect(send).toHaveBeenCalledTimes(2)
-    expect(result.response.claimsOverrideDetails?.claimsToAddOrOverride).toEqual({
-      'custom:orgId': 'org-1',
-      'custom:role': 'member',
-    })
-  })
-
-  it('provisions a new org and admin user on first login', async () => {
-    send
-      .mockResolvedValueOnce({ Items: [] }) // Query by-email: no match
-      .mockResolvedValueOnce({ Item: undefined }) // Get by sub: no match
       .mockResolvedValueOnce({}) // Put org
       .mockResolvedValueOnce({}) // Put user
+      .mockResolvedValueOnce({}) // Put linkIdentity
+      .mockResolvedValueOnce({}) // Put auth method
+      .mockResolvedValueOnce({}) // Put audit
 
     const result = await handler(baseEvent(), {} as never, () => undefined) as PreTokenGenerationTriggerEvent
 
-    expect(send).toHaveBeenCalledTimes(4)
+    expect(send).toHaveBeenCalledTimes(7)
     const claims = result.response.claimsOverrideDetails?.claimsToAddOrOverride as Record<string, string>
     expect(claims['custom:role']).toBe('admin')
     expect(typeof claims['custom:orgId']).toBe('string')
+    expect(typeof claims['custom:accountId']).toBe('string')
+
+    const linkPut = send.mock.calls[4]?.[0] as { input: { TableName: string; Item: Record<string, unknown> } }
+    expect(linkPut.input.TableName).toBe('heediq-cognito-identities')
+    expect(linkPut.input.Item['accountId']).toBe(claims['custom:accountId'])
   })
 
   it('provisions an org/user even when email_verified is false (D-090 — supersedes D-080)', async () => {
     send
-      .mockResolvedValueOnce({ Items: [] })
       .mockResolvedValueOnce({ Item: undefined })
+      .mockResolvedValueOnce({ Items: [] })
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({})
       .mockResolvedValueOnce({})
       .mockResolvedValueOnce({})
 
@@ -94,14 +102,17 @@ describe('auth-provision handler', () => {
       () => undefined,
     ) as PreTokenGenerationTriggerEvent
 
-    expect(send).toHaveBeenCalledTimes(4)
+    expect(send).toHaveBeenCalledTimes(7)
     expect(result.response.claimsOverrideDetails?.claimsToAddOrOverride).toBeDefined()
   })
 
   it('normalizes email to lowercase/trimmed before writing the user row', async () => {
     send
-      .mockResolvedValueOnce({ Items: [] })
       .mockResolvedValueOnce({ Item: undefined })
+      .mockResolvedValueOnce({ Items: [] })
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({})
       .mockResolvedValueOnce({})
       .mockResolvedValueOnce({})
 
@@ -117,13 +128,16 @@ describe('auth-provision handler', () => {
 
   it('sets passwordSet=false for a federated-only first login', async () => {
     send
-      .mockResolvedValueOnce({ Items: [] })
       .mockResolvedValueOnce({ Item: undefined })
+      .mockResolvedValueOnce({ Items: [] })
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({})
       .mockResolvedValueOnce({})
       .mockResolvedValueOnce({})
 
     await handler(
-      baseEvent({ identities: '[{"providerName":"Google"}]' }),
+      baseEvent({ identities: '[{"providerName":"Google","userId":"g-1"}]' }),
       {} as never,
       () => undefined,
     )
@@ -134,8 +148,11 @@ describe('auth-provision handler', () => {
 
   it('sets passwordSet=true for a native email/password first login', async () => {
     send
-      .mockResolvedValueOnce({ Items: [] })
       .mockResolvedValueOnce({ Item: undefined })
+      .mockResolvedValueOnce({ Items: [] })
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({})
       .mockResolvedValueOnce({})
       .mockResolvedValueOnce({})
 

@@ -18,6 +18,10 @@ vi.mock('../config.js', () => ({
       usersTable: 'heediq-users',
       jobsTable: 'heediq-jobs',
       wsConnectionsTable: 'heediq-ws-connections',
+      userAuthMethodsTable: 'heediq-user-auth-methods',
+      authAuditLogTable: 'heediq-auth-audit-log',
+      rateLimitsTable: 'heediq-rate-limits',
+      cognitoIdentitiesTable: 'heediq-cognito-identities',
     },
     s3: { audioBucket: 'heediq-audio', presignedUrlExpiresIn: 900 },
     sqs: { transcriptionQueueUrl: 'https://sqs.eu-west-1/q/transcription', summarizationQueueUrl: 'https://sqs.eu-west-1/q/summarization' },
@@ -53,10 +57,14 @@ describe('authMiddleware', () => {
     expect(res.status).toBe(401)
   })
 
-  it('sets context variables from valid token', async () => {
+  // D-099: userId comes from the app-owned `custom:accountId` claim, never the raw Cognito
+  // `sub` — `sub` can be repointed onto a different Cognito user by AdminLinkProviderForUser
+  // during account linking, so it's not a stable identity key.
+  it('sets userId from custom:accountId, not sub, on a valid token', async () => {
     vi.mocked(jwtVerify).mockResolvedValueOnce({
       payload: {
-        sub: 'user-1',
+        sub: 'raw-cognito-sub',
+        'custom:accountId': 'account-1',
         'custom:orgId': 'org-1',
         email: 'a@b.com',
         'custom:role': 'member',
@@ -67,13 +75,31 @@ describe('authMiddleware', () => {
     const res = await app.request('/test', { headers: { Authorization: 'Bearer valid-token' } })
     expect(res.status).toBe(200)
     const body = await res.json() as { userId: string; orgId: string }
-    expect(body.userId).toBe('user-1')
+    expect(body.userId).toBe('account-1')
     expect(body.orgId).toBe('org-1')
   })
 
-  it('returns 401 when token is missing required claims', async () => {
+  it('returns 401 when the token is missing custom:accountId (predates D-099 or minted before first-login provisioning)', async () => {
     vi.mocked(jwtVerify).mockResolvedValueOnce({
-      payload: { sub: 'user-1' }, // missing orgId, email, role
+      payload: {
+        sub: 'raw-cognito-sub',
+        'custom:orgId': 'org-1',
+        email: 'a@b.com',
+        'custom:role': 'member',
+      },
+      protectedHeader: { alg: 'RS256' },
+    } as Awaited<ReturnType<typeof jwtVerify>>)
+
+    const res = await app.request('/test', { headers: { Authorization: 'Bearer valid-token' } })
+    expect(res.status).toBe(401)
+    const body = await res.json() as { ok: boolean; error: { code: string; message: string } }
+    expect(body.error.code).toBe('UNAUTHORIZED')
+    expect(body.error.message).toMatch(/missing required claims/i)
+  })
+
+  it('returns 401 when token is missing other required claims (orgId, email, role)', async () => {
+    vi.mocked(jwtVerify).mockResolvedValueOnce({
+      payload: { sub: 'user-1', 'custom:accountId': 'account-1' }, // missing orgId, email, role
       protectedHeader: { alg: 'RS256' },
     } as Awaited<ReturnType<typeof jwtVerify>>)
 

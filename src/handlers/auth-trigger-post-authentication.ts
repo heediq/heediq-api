@@ -1,5 +1,5 @@
 import type { PostAuthenticationTriggerHandler } from 'aws-lambda'
-import { QueryCommand, PutCommand } from '@aws-sdk/lib-dynamodb'
+import { PutCommand } from '@aws-sdk/lib-dynamodb'
 import {
   CognitoIdentityProviderClient,
   ListUsersCommand,
@@ -7,6 +7,7 @@ import {
   type UserType,
 } from '@aws-sdk/client-cognito-identity-provider'
 import { dynamo } from '../lib/dynamo.js'
+import { resolveAccountIdBySub, resolveAccountIdByEmail, linkIdentity } from '../lib/accountIdentity.js'
 import { createLogger } from '@heediq/shared'
 
 function requireEnv(name: string): string {
@@ -18,6 +19,7 @@ function requireEnv(name: string): string {
 const USERS_TABLE = requireEnv('USERS_TABLE_NAME')
 const USER_AUTH_METHODS_TABLE = requireEnv('USER_AUTH_METHODS_TABLE_NAME')
 const AUTH_AUDIT_LOG_TABLE = requireEnv('AUTH_AUDIT_LOG_TABLE_NAME')
+const IDENTITIES_TABLE = requireEnv('COGNITO_IDENTITIES_TABLE_NAME')
 
 const cognito = new CognitoIdentityProviderClient({})
 const logger = createLogger('heediq-api')
@@ -50,17 +52,6 @@ function providerFromIdentitiesAttr(raw: string | undefined): { providerName: st
   return null
 }
 
-async function resolveAccountIdByEmail(email: string): Promise<string | null> {
-  const result = await dynamo.send(new QueryCommand({
-    TableName: USERS_TABLE,
-    IndexName: 'by-email',
-    KeyConditionExpression: 'email = :email',
-    ExpressionAttributeValues: { ':email': email },
-    Limit: 1,
-  }))
-  return (result.Items?.[0]?.['userId'] as string | undefined) ?? null
-}
-
 async function upsertAuthMethod(accountId: string, providerName: string, providerSub: string, username: string) {
   await dynamo.send(new PutCommand({
     TableName: USER_AUTH_METHODS_TABLE,
@@ -87,11 +78,17 @@ async function putAudit(accountId: string, action: string, provider: string, det
   }))
 }
 
-// Fires on every successful sign-in. Two jobs: (1) record this session's auth method if it's
-// federated and not yet recorded, and (2) if the user signed in via a provider that isn't yet
-// linked to their native/canonical account, auto-link it now — a safety net for cases the
-// PreSignUp trigger's proactive link couldn't resolve at signup time (e.g. the native account
-// didn't exist yet then).
+// Fires on every successful sign-in, before PreTokenGeneration (auth-provision.ts). Two jobs:
+// (1) record this session's auth method if it's federated and not yet recorded, and (2) if the
+// user signed in via a provider that isn't yet linked to their native/canonical account,
+// auto-link it now — a safety net for cases the PreSignUp trigger's proactive link couldn't
+// resolve at signup time (e.g. the native account didn't exist yet then).
+//
+// canonicalAccountId is resolved the same way auth-provision.ts resolves it (identities table
+// first, D-099; email guess as self-heal fallback) so the auth-method/audit records this
+// handler writes land under the same accountId that PreTokenGeneration will assign moments
+// later — using a different resolution here was the source of a real bug where linked-account
+// auth methods became invisible to `/auth/methods` (see D-099).
 export const handler: PostAuthenticationTriggerHandler = async (event) => {
   if (event.triggerSource !== 'PostAuthentication_Authentication') return event
 
@@ -102,17 +99,24 @@ export const handler: PostAuthenticationTriggerHandler = async (event) => {
   const username = event.userName
   if (!accountSub) return event
 
-  const existingAccountId = email ? await resolveAccountIdByEmail(email) : null
-  let canonicalAccountId = existingAccountId ?? accountSub
+  const resolvedAccountId =
+    (await resolveAccountIdBySub(IDENTITIES_TABLE, accountSub)) ??
+    (email ? await resolveAccountIdByEmail(USERS_TABLE, email) : undefined)
 
   const usersByEmail = email
     ? (await cognito.send(new ListUsersCommand({ UserPoolId: userPoolId, Filter: `email = "${email}"`, Limit: 10 }))).Users ?? []
     : []
   const nativeUser = usersByEmail.find((u) => !isExternalProviderUser(u))
-  if (nativeUser && !existingAccountId) {
-    const nativeSub = getUserAttribute(nativeUser, 'sub')
-    if (nativeSub) canonicalAccountId = nativeSub
-  }
+
+  // No mapping and no DynamoDB row yet, but a native Cognito user exists for this email — use
+  // its sub, since that's the sub future logins through the eventually-linked provider will
+  // present (AdminLinkProviderForUser below repoints them there).
+  const canonicalAccountId = resolvedAccountId ?? (nativeUser ? getUserAttribute(nativeUser, 'sub') : undefined) ?? accountSub
+
+  // Pin this sub to its resolved accountId now (D-099) so this session's PreTokenGeneration
+  // call (which fires right after, for the same sub) resolves deterministically instead of
+  // re-running the email guess.
+  if (!resolvedAccountId) await linkIdentity(IDENTITIES_TABLE, accountSub, canonicalAccountId)
 
   const currentUsers = (await cognito.send(new ListUsersCommand({ UserPoolId: userPoolId, Filter: `sub = "${accountSub}"`, Limit: 1 }))).Users ?? []
   const currentUser = currentUsers[0]

@@ -1,6 +1,7 @@
 import type { PostConfirmationTriggerHandler } from 'aws-lambda'
-import { QueryCommand, PutCommand } from '@aws-sdk/lib-dynamodb'
+import { PutCommand } from '@aws-sdk/lib-dynamodb'
 import { dynamo } from '../lib/dynamo.js'
+import { resolveAccountIdBySub, resolveAccountIdByEmail } from '../lib/accountIdentity.js'
 import { createLogger } from '@heediq/shared'
 
 function requireEnv(name: string): string {
@@ -12,6 +13,7 @@ function requireEnv(name: string): string {
 const USERS_TABLE = requireEnv('USERS_TABLE_NAME')
 const USER_AUTH_METHODS_TABLE = requireEnv('USER_AUTH_METHODS_TABLE_NAME')
 const AUTH_AUDIT_LOG_TABLE = requireEnv('AUTH_AUDIT_LOG_TABLE_NAME')
+const IDENTITIES_TABLE = requireEnv('COGNITO_IDENTITIES_TABLE_NAME')
 const logger = createLogger('heediq-api')
 
 function isAwsError(err: unknown): err is { name: string } {
@@ -34,17 +36,6 @@ function providerFromIdentitiesAttr(raw: string | undefined): { providerName: st
   return null
 }
 
-async function resolveAccountIdByEmail(email: string): Promise<string | null> {
-  const result = await dynamo.send(new QueryCommand({
-    TableName: USERS_TABLE,
-    IndexName: 'by-email',
-    KeyConditionExpression: 'email = :email',
-    ExpressionAttributeValues: { ':email': email },
-    Limit: 1,
-  }))
-  return (result.Items?.[0]?.['userId'] as string | undefined) ?? null
-}
-
 async function upsertAuthMethod(accountId: string, providerName: string, providerSub: string, username: string) {
   await dynamo.send(new PutCommand({
     TableName: USER_AUTH_METHODS_TABLE,
@@ -63,20 +54,31 @@ async function upsertAuthMethod(accountId: string, providerName: string, provide
   })
 }
 
-// Fires once, right after a Cognito user (native or federated) confirms sign-up. Records which
-// method this account first authenticated with — the `users` row itself is seeded lazily by the
-// PreTokenGeneration trigger (auth-provision.ts) at first login, not here, so a row may not exist
-// yet; `by-email` lookup falls back to this event's own `sub` when so.
+// Fires once, right after a Cognito user (native or federated) confirms sign-up — before the
+// PreTokenGeneration trigger (auth-provision.ts) has run, so for a genuinely new signup no
+// accountId exists yet to write under (D-099: accountId is a fresh app-owned id, not this
+// event's `sub`, so guessing `sub` here would silently orphan the record under a key
+// auth-provision.ts will never use). Only write when an existing account can be positively
+// resolved (an already-linked identity, or an email match for a pre-existing account); a
+// genuinely new account's initial auth method + audit entry are instead recorded by
+// auth-provision.ts at first login, once the real accountId is known.
 export const handler: PostConfirmationTriggerHandler = async (event) => {
   if (event.triggerSource !== 'PostConfirmation_ConfirmSignUp') return event
 
-  const accountId = event.request.userAttributes['sub']
+  const sub = event.request.userAttributes['sub']
   const email = event.request.userAttributes['email']?.trim().toLowerCase()
   const identitiesAttr = event.request.userAttributes['identities']
   const username = event.userName
   const now = new Date().toISOString()
 
-  const canonicalAccountId = (email ? await resolveAccountIdByEmail(email) : null) ?? accountId
+  const canonicalAccountId =
+    (await resolveAccountIdBySub(IDENTITIES_TABLE, sub)) ??
+    (email ? await resolveAccountIdByEmail(USERS_TABLE, email) : undefined)
+
+  if (!canonicalAccountId) {
+    logger.info('No existing account for this signup — initial auth method recorded at first login instead', { sub })
+    return event
+  }
 
   const providerContext = providerFromIdentitiesAttr(identitiesAttr)
   if (providerContext) {
