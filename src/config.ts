@@ -1,6 +1,6 @@
 // All values injected as Lambda env vars by CDK (ApiStack) at deploy time — D-038.
-// Secrets (Stripe, Claude, Recall.ai) are fetched from Secrets Manager at cold start
-// via the AWS Parameters and Secrets Lambda Extension, never from env vars.
+// Secrets (Stripe, Claude, Recall.ai) are fetched from Secrets Manager at cold start via a
+// direct SDK call cached at module scope (D-100), never from env vars or an Extension layer.
 
 function requireEnv(name: string): string {
   const v = process.env[name]
