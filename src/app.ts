@@ -8,6 +8,9 @@ import { sourcesRouter } from './routes/sources.js'
 import { uploadRouter } from './routes/upload.js'
 import { authRouter } from './routes/auth.js'
 import { authMethodsRouter } from './routes/auth-methods.js'
+import { rolesRouter } from './routes/roles.js'
+import { groupsRouter } from './routes/groups.js'
+import { roleAssignmentsRouter } from './routes/role-assignments.js'
 import { config } from './config.js'
 import { apiError } from './lib/errors.js'
 
@@ -39,6 +42,12 @@ v1.route('/me', meRouter)
 v1.route('/sources', sourcesRouter)
 v1.route('/upload', uploadRouter)
 v1.route('/auth/methods', authMethodsRouter)
+v1.route('/roles', rolesRouter)
+v1.route('/groups', groupsRouter)
+// D-102: roleAssignmentsRouter declares its own `/:userId/role-assignments...` paths (rather
+// than being mounted under a parent `:userId` segment) so Hono's route-param typing recognizes
+// `userId` within the router — a parent-level param isn't visible to a Hono sub-app's own types.
+v1.route('/users', roleAssignmentsRouter)
 
 app.route('/api/v1', v1)
 

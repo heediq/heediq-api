@@ -24,6 +24,10 @@ export const config = {
     authAuditLogTable: requireEnv('AUTH_AUDIT_LOG_TABLE_NAME'),
     rateLimitsTable: requireEnv('RATE_LIMITS_TABLE_NAME'),
     cognitoIdentitiesTable: requireEnv('COGNITO_IDENTITIES_TABLE_NAME'),
+    rolesTable: requireEnv('ROLES_TABLE_NAME'),
+    groupsTable: requireEnv('GROUPS_TABLE_NAME'),
+    roleAssignmentsTable: requireEnv('ROLE_ASSIGNMENTS_TABLE_NAME'),
+    auditLogTable: requireEnv('AUDIT_LOG_TABLE_NAME'),
   },
   s3: {
     audioBucket: requireEnv('AUDIO_BUCKET_NAME'),
