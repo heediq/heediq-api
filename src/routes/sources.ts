@@ -30,6 +30,10 @@ type SourcesContext = AuthContext & RequestIdContext
 
 const sources = new Hono<SourcesContext>()
 
+function isAwsError(err: unknown): err is { name: string } {
+  return typeof err === 'object' && err !== null && 'name' in err
+}
+
 // GET /api/v1/sources — list org sources, cursor-paginated
 sources.get('/', async (c) => {
   const orgId = c.get('orgId')
@@ -40,7 +44,7 @@ sources.get('/', async (c) => {
 
   const result = await dynamo.send(new QueryCommand({
     TableName: config.dynamo.sourcesTable,
-    IndexName: 'by-org',
+    IndexName: 'by-org-created',
     KeyConditionExpression: 'orgId = :orgId',
     ExpressionAttributeValues: {
       ':orgId': orgId,
@@ -96,9 +100,9 @@ sources.get('/:id', async (c) => {
   const id = c.req.param('id')
   const res = await dynamo.send(new GetCommand({
     TableName: config.dynamo.sourcesTable,
-    Key: { sourceId: id },
+    Key: { orgId, sourceId: id },
   }))
-  if (!res.Item || res.Item['orgId'] !== orgId) {
+  if (!res.Item) {
     return apiError(c, 'NOT_FOUND', 'Source not found')
   }
   return ok(c, { source: SourceSchema.parse(res.Item) })
@@ -115,15 +119,23 @@ sources.patch('/:id', async (c) => {
   }
 
   const now = new Date().toISOString()
-  const res = await dynamo.send(new UpdateCommand({
-    TableName: config.dynamo.sourcesTable,
-    Key: { sourceId: id },
-    ConditionExpression: 'orgId = :orgId',
-    UpdateExpression: 'SET #title = :title, updatedAt = :now',
-    ExpressionAttributeNames: { '#title': 'title' },
-    ExpressionAttributeValues: { ':orgId': orgId, ':title': parsed.data.title, ':now': now },
-    ReturnValues: 'ALL_NEW',
-  }))
+  let res
+  try {
+    res = await dynamo.send(new UpdateCommand({
+      TableName: config.dynamo.sourcesTable,
+      Key: { orgId, sourceId: id },
+      ConditionExpression: 'attribute_exists(sourceId)',
+      UpdateExpression: 'SET #title = :title, updatedAt = :now',
+      ExpressionAttributeNames: { '#title': 'title' },
+      ExpressionAttributeValues: { ':title': parsed.data.title, ':now': now },
+      ReturnValues: 'ALL_NEW',
+    }))
+  } catch (err: unknown) {
+    if (isAwsError(err) && err.name === 'ConditionalCheckFailedException') {
+      return apiError(c, 'NOT_FOUND', 'Source not found')
+    }
+    throw err
+  }
 
   logger.info('Source updated', { requestId: c.get('requestId'), sourceId: id, orgId })
   return ok(c, { source: SourceSchema.parse(res.Attributes) })
@@ -134,14 +146,21 @@ sources.delete('/:id', async (c) => {
   const orgId = c.get('orgId')
   const id = c.req.param('id')
   const now = new Date().toISOString()
-  await dynamo.send(new UpdateCommand({
-    TableName: config.dynamo.sourcesTable,
-    Key: { sourceId: id },
-    ConditionExpression: 'orgId = :orgId',
-    UpdateExpression: 'SET #status = :status, deletedAt = :now, updatedAt = :now',
-    ExpressionAttributeNames: { '#status': 'status' },
-    ExpressionAttributeValues: { ':orgId': orgId, ':status': 'failed', ':now': now },
-  }))
+  try {
+    await dynamo.send(new UpdateCommand({
+      TableName: config.dynamo.sourcesTable,
+      Key: { orgId, sourceId: id },
+      ConditionExpression: 'attribute_exists(sourceId)',
+      UpdateExpression: 'SET #status = :status, deletedAt = :now, updatedAt = :now',
+      ExpressionAttributeNames: { '#status': 'status' },
+      ExpressionAttributeValues: { ':status': 'failed', ':now': now },
+    }))
+  } catch (err: unknown) {
+    if (isAwsError(err) && err.name === 'ConditionalCheckFailedException') {
+      return apiError(c, 'NOT_FOUND', 'Source not found')
+    }
+    throw err
+  }
   logger.info('Source soft-deleted', { requestId: c.get('requestId'), sourceId: id, orgId })
   return ok(c, { deleted: true })
 })
@@ -158,11 +177,11 @@ sources.post('/:id/jobs', async (c) => {
 
   // D-060: fetch org plan and enforce model access before enqueue
   const [srcRes, orgRes] = await Promise.all([
-    dynamo.send(new GetCommand({ TableName: config.dynamo.sourcesTable, Key: { sourceId: id } })),
+    dynamo.send(new GetCommand({ TableName: config.dynamo.sourcesTable, Key: { orgId, sourceId: id } })),
     dynamo.send(new GetCommand({ TableName: config.dynamo.orgsTable, Key: { orgId } })),
   ])
 
-  if (!srcRes.Item || srcRes.Item['orgId'] !== orgId) {
+  if (!srcRes.Item) {
     return apiError(c, 'NOT_FOUND', 'Source not found')
   }
   if (!srcRes.Item['audioS3Key']) {
@@ -223,9 +242,9 @@ sources.get('/:id/summary', async (c) => {
   const id = c.req.param('id')
   const res = await dynamo.send(new GetCommand({
     TableName: config.dynamo.sourcesTable,
-    Key: { sourceId: id },
+    Key: { orgId, sourceId: id },
   }))
-  if (!res.Item || res.Item['orgId'] !== orgId) {
+  if (!res.Item) {
     return apiError(c, 'NOT_FOUND', 'Source not found')
   }
   if (!res.Item['summary']) {
