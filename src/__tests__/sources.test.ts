@@ -70,6 +70,14 @@ describe('GET /sources', () => {
     expect(body.ok).toBe(true)
     expect(body.data.sources).toHaveLength(1)
   })
+
+  it('queries the by-org-created GSI, not the nonexistent by-org index', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Items: [] })
+    await makeApp().request('/')
+    expect(mockDynamoSend).toHaveBeenCalledWith(
+      expect.objectContaining({ input: expect.objectContaining({ IndexName: 'by-org-created' }) }),
+    )
+  })
 })
 
 describe('POST /sources', () => {
@@ -108,10 +116,21 @@ describe('GET /:id — org isolation', () => {
     expect(res.status).toBe(200)
   })
 
-  it('returns 404 when source belongs to different org', async () => {
+  it('keys the Get by orgId + sourceId (composite key, not sourceId alone)', async () => {
     mockDynamoSend.mockResolvedValueOnce({
-      Item: { sourceId: uuid, orgId: '00000000-0000-0000-0000-000000000099', userId: userId, title: 'T', status: 'ready', labels: [], createdAt: now, updatedAt: now },
+      Item: { sourceId: uuid, orgId: orgId, userId: userId, title: 'T', status: 'ready', labels: [], createdAt: now, updatedAt: now },
     })
+    await makeApp().request(`/${uuid}`)
+    expect(mockDynamoSend).toHaveBeenCalledWith(
+      expect.objectContaining({ input: expect.objectContaining({ Key: { orgId, sourceId: uuid } }) }),
+    )
+  })
+
+  it('returns 404 when source belongs to a different org — Key lookup with the wrong orgId finds nothing', async () => {
+    // Real DynamoDB: Key={orgId: <this org>, sourceId} simply doesn't match an item that
+    // lives under a different org's partition, so the Get returns no Item — never a
+    // cross-org Item to filter out client-side.
+    mockDynamoSend.mockResolvedValueOnce({ Item: undefined })
     const res = await makeApp().request(`/${uuid}`)
     expect(res.status).toBe(404)
   })
@@ -191,9 +210,9 @@ describe('POST /:id/jobs — D-060 access control', () => {
     expect(res.status).toBe(201)
   })
 
-  it('returns 404 when source is from different org', async () => {
+  it('returns 404 when source is from a different org — Key lookup with the wrong orgId finds nothing', async () => {
     mockDynamoSend
-      .mockResolvedValueOnce({ Item: { sourceId: uuid, orgId: '00000000-0000-0000-0000-000000000099', audioS3Key: 'key' } })
+      .mockResolvedValueOnce({ Item: undefined })
       .mockResolvedValueOnce({ Item: { orgId: orgId, plan: 'free' } })
 
     const res = await makeApp().request(`/${uuid}/jobs`, {
@@ -202,6 +221,24 @@ describe('POST /:id/jobs — D-060 access control', () => {
       body: JSON.stringify({ sourceId: uuid, model: 'small' }),
     })
     expect(res.status).toBe(404)
+  })
+
+  it('keys the source Get by orgId + sourceId', async () => {
+    mockDynamoSend
+      .mockResolvedValueOnce({ Item: { sourceId: uuid, orgId: orgId, audioS3Key: 'key' } })
+      .mockResolvedValueOnce({ Item: { orgId: orgId, plan: 'free' } })
+      .mockResolvedValueOnce({})
+    mockSqsSend.mockResolvedValueOnce({})
+
+    await makeApp().request(`/${uuid}/jobs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sourceId: uuid, model: 'small' }),
+    })
+
+    expect(mockDynamoSend).toHaveBeenNthCalledWith(1,
+      expect.objectContaining({ input: expect.objectContaining({ Key: { orgId, sourceId: uuid } }) }),
+    )
   })
 
   it('returns 400 when no audio uploaded yet', async () => {
@@ -215,5 +252,71 @@ describe('POST /:id/jobs — D-060 access control', () => {
       body: JSON.stringify({ sourceId: uuid, model: 'small' }),
     })
     expect(res.status).toBe(400)
+  })
+
+  it('writes the job item keyed by sourceId (heediq-jobs has no jobId key attribute)', async () => {
+    mockDynamoSend
+      .mockResolvedValueOnce({ Item: { sourceId: uuid, orgId: orgId, audioS3Key: 'key' } })
+      .mockResolvedValueOnce({ Item: { orgId: orgId, plan: 'free' } })
+      .mockResolvedValueOnce({})
+    mockSqsSend.mockResolvedValueOnce({})
+
+    await makeApp().request(`/${uuid}/jobs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sourceId: uuid, model: 'small' }),
+    })
+
+    expect(mockDynamoSend).toHaveBeenNthCalledWith(3,
+      expect.objectContaining({ input: expect.objectContaining({ Item: expect.objectContaining({ sourceId: uuid }) }) }),
+    )
+  })
+})
+
+describe('PATCH /:id — org isolation', () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  it('keys the Update by orgId + sourceId and updates the title', async () => {
+    mockDynamoSend.mockResolvedValueOnce({
+      Attributes: { sourceId: uuid, orgId: orgId, userId: userId, title: 'New', status: 'ready', labels: [], createdAt: now, updatedAt: now },
+    })
+    const res = await makeApp().request(`/${uuid}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'New' }),
+    })
+    expect(res.status).toBe(200)
+    expect(mockDynamoSend).toHaveBeenCalledWith(
+      expect.objectContaining({ input: expect.objectContaining({ Key: { orgId, sourceId: uuid } }) }),
+    )
+  })
+
+  it('returns 404 when the conditional check fails (wrong org or missing source)', async () => {
+    mockDynamoSend.mockRejectedValueOnce(Object.assign(new Error('conflict'), { name: 'ConditionalCheckFailedException' }))
+    const res = await makeApp().request(`/${uuid}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'New' }),
+    })
+    expect(res.status).toBe(404)
+  })
+})
+
+describe('DELETE /:id — org isolation', () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  it('keys the Update by orgId + sourceId', async () => {
+    mockDynamoSend.mockResolvedValueOnce({})
+    const res = await makeApp().request(`/${uuid}`, { method: 'DELETE' })
+    expect(res.status).toBe(200)
+    expect(mockDynamoSend).toHaveBeenCalledWith(
+      expect.objectContaining({ input: expect.objectContaining({ Key: { orgId, sourceId: uuid } }) }),
+    )
+  })
+
+  it('returns 404 when the conditional check fails (wrong org or missing source)', async () => {
+    mockDynamoSend.mockRejectedValueOnce(Object.assign(new Error('conflict'), { name: 'ConditionalCheckFailedException' }))
+    const res = await makeApp().request(`/${uuid}`, { method: 'DELETE' })
+    expect(res.status).toBe(404)
   })
 })
