@@ -1,4 +1,4 @@
-import { Hono, type Context } from 'hono'
+import { Hono } from 'hono'
 import { GetCommand, PutCommand, UpdateCommand, DeleteCommand, QueryCommand, BatchGetCommand } from '@aws-sdk/lib-dynamodb'
 import { randomUUID } from 'crypto'
 import { dynamo } from '../lib/dynamo.js'
@@ -6,6 +6,7 @@ import { writeAuditEvent } from '../lib/audit.js'
 import { apiError, ok } from '../lib/errors.js'
 import { config } from '../config.js'
 import type { AuthContext } from '../middleware/auth.js'
+import { requirePermission } from '../middleware/rbac.js'
 import type { RequestIdContext } from '../middleware/request-id.js'
 import { GroupSchema, CreateGroupRequestSchema, UpdateGroupRequestSchema, createLogger, type Group } from '@heediq/shared'
 
@@ -17,11 +18,6 @@ const groups = new Hono<GroupsContext>()
 
 function isAwsError(err: unknown): err is { name: string } {
   return typeof err === 'object' && err !== null && 'name' in err
-}
-
-// Interim write gate — see roles.ts for rationale (D-102 permission enforcement lands later).
-function requireAdmin(c: Context<GroupsContext>): boolean {
-  return c.get('role') === 'admin'
 }
 
 // Confirms every roleId in the list resolves to a role row in this org — a group must never
@@ -48,11 +44,8 @@ groups.get('/', async (c) => {
   return ok(c, { groups: items })
 })
 
-// POST /api/v1/groups — create group (admin-only)
-groups.post('/', async (c) => {
-  if (!requireAdmin(c)) {
-    return apiError(c, 'FORBIDDEN', 'Only org admins can manage groups')
-  }
+// POST /api/v1/groups — create group
+groups.post('/', requirePermission('org:manage-roles'), async (c) => {
   const orgId = c.get('orgId')
   const body = await c.req.json()
   const parsed = CreateGroupRequestSchema.safeParse(body)
@@ -104,11 +97,8 @@ groups.get('/:id', async (c) => {
   return ok(c, { group: GroupSchema.parse(res.Item) })
 })
 
-// PATCH /api/v1/groups/:id — admin-only
-groups.patch('/:id', async (c) => {
-  if (!requireAdmin(c)) {
-    return apiError(c, 'FORBIDDEN', 'Only org admins can manage groups')
-  }
+// PATCH /api/v1/groups/:id
+groups.patch('/:id', requirePermission('org:manage-roles'), async (c) => {
   const orgId = c.get('orgId')
   const id = c.req.param('id')
   const body = await c.req.json()
@@ -173,11 +163,8 @@ groups.patch('/:id', async (c) => {
   return ok(c, { group: after })
 })
 
-// DELETE /api/v1/groups/:id — admin-only
-groups.delete('/:id', async (c) => {
-  if (!requireAdmin(c)) {
-    return apiError(c, 'FORBIDDEN', 'Only org admins can manage groups')
-  }
+// DELETE /api/v1/groups/:id
+groups.delete('/:id', requirePermission('org:manage-roles'), async (c) => {
   const orgId = c.get('orgId')
   const id = c.req.param('id')
   const key = { pk: `ORG#${orgId}`, sk: `GROUP#${id}` }

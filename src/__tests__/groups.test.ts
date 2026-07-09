@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { Hono } from 'hono'
+import { DEFAULT_ORG_RBAC_SEED } from '@heediq/shared'
 import type { AuthContext } from '../middleware/auth.js'
 
 const mockDynamoSend = vi.hoisted(() => vi.fn())
@@ -27,6 +28,7 @@ function makeApp(role: 'admin' | 'member' = 'admin') {
     c.set('orgId', orgId)
     c.set('email', 'admin@acme.com')
     c.set('role', role)
+    c.set('permissions', [...DEFAULT_ORG_RBAC_SEED[role].permissions])
     await next()
   })
   app.route('/', groupsRouter)
@@ -94,7 +96,7 @@ describe('POST /groups', () => {
     expect(mockDynamoSend).toHaveBeenCalledTimes(1)
   })
 
-  it('rejects a non-admin caller', async () => {
+  it('rejects a caller missing org:manage-roles', async () => {
     const res = await makeApp('member').request('/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -135,7 +137,7 @@ describe('GET /groups/:id', () => {
 describe('PATCH /groups/:id', () => {
   beforeEach(() => vi.clearAllMocks())
 
-  it('rejects a non-admin caller', async () => {
+  it('rejects a caller missing org:manage-roles', async () => {
     const res = await makeApp('member').request(`/${groupId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -186,7 +188,7 @@ describe('PATCH /groups/:id', () => {
 describe('DELETE /groups/:id', () => {
   beforeEach(() => vi.clearAllMocks())
 
-  it('rejects a non-admin caller', async () => {
+  it('rejects a caller missing org:manage-roles', async () => {
     const res = await makeApp('member').request(`/${groupId}`, { method: 'DELETE' })
     expect(res.status).toBe(403)
   })

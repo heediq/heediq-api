@@ -11,7 +11,9 @@ All Heediq REST endpoints in a single Lambda function. Handles auth, Source CRUD
 - `src/app.ts` — Hono app: CORS, auth middleware wiring, `/api/v1/` route registration
 - `src/lambda.ts` — Lambda handler (`hono/aws-lambda`)
 - `src/config.ts` — env var config (all injected by CDK at deploy, D-038)
-- `src/middleware/auth.ts` — JWKS-based Cognito JWT validation (jose), sets `userId/orgId/email/role` on context (D-041). `userId` is read from the `custom:accountId` claim, never `sub` (D-099) — `sub` can be repointed to a different Cognito user by `AdminLinkProviderForUser` during account linking, so it's not a stable identity key.
+- `src/middleware/auth.ts` — JWKS-based Cognito JWT validation (jose), sets `userId/orgId/email/role/permissions` on context (D-041). `userId` is read from the `custom:accountId` claim, never `sub` (D-099) — `sub` can be repointed to a different Cognito user by `AdminLinkProviderForUser` during account linking, so it's not a stable identity key. `permissions` is parsed from the `custom:permissions` JWT claim (JSON-stringified `Permission[]`, D-105) — a missing/malformed/unknown-value claim is rejected with `401 UNAUTHORIZED`.
+- `src/middleware/rbac.ts` — `requirePermission(permission)` (D-105): route-level middleware that checks `c.get('permissions').includes(permission)`, a pure in-token check with no DynamoDB read; returns `403 FORBIDDEN` naming the missing permission.
+- `src/lib/rbac.ts` — `ensureOrgRbacSeeded`, `ensureUserRoleAssignment`, `resolveEffectivePermissions` (D-102/D-105): takes an explicit `RbacTables` parameter object rather than importing `config.ts`, since `auth-provision.ts` (its only caller) is a separate minimal-env Lambda that would crash importing the full API's `config.ts`. `resolveEffectivePermissions` unions permissions from every role reached directly or via group membership.
 - `src/middleware/request-id.ts` — correlation ID middleware (D-085): reads `X-Request-Id` from the caller or generates a UUID, sets it on context, and echoes it back as a response header
 - `src/lib/errors.ts` — `apiError()` / `ok()` response helpers with consistent envelope (D-033)
 - `src/lib/dynamo.ts` — DynamoDB Document Client singleton
@@ -21,15 +23,15 @@ All Heediq REST endpoints in a single Lambda function. Handles auth, Source CRUD
 - `src/routes/auth.ts` — unauthenticated `/api/v1/auth` sub-app: `lookup-email` + D-087/D-089 cross-provider linking (`link/request-otp`, `link/verify-otp`, `link/confirm`)
 - `src/lib/cognito.ts` — Cognito Identity Provider SDK wrapper (`SignUp`, `ConfirmSignUp`, `ResendConfirmationCode`, `AdminSetUserPassword`, `AdminLinkProviderForUser`, `AdminDeleteUser`, `AdminCreateUser`, `ListUsers`) used by `routes/auth.ts` and the trigger handlers below
 - `src/lib/accountIdentity.ts` — shared identity-resolution helpers (D-099): `resolveAccountIdBySub` (deterministic `heediq-cognito-identities` lookup), `linkIdentity` (pins a `sub → accountId` mapping), `resolveAccountIdByEmail` (fallback-only self-heal via the `by-email` GSI, provisional until pinned). Used by every auth handler/route below instead of each duplicating its own lookup.
-- `src/handlers/auth-provision.ts` — Cognito PreTokenGeneration trigger (D-077/D-099): resolves `accountId` via `heediq-cognito-identities` first (deterministic); falls back to the `by-email` self-heal, pinning the mapping via `linkIdentity` for future logins; on a genuinely first login, generates a new app-owned `accountId` (`randomUUID`, decoupled from `sub`) and writes org + user + identity mapping + initial auth-method + audit entries in one `Promise.all`. Always emits `custom:accountId`/`custom:orgId`/`custom:role` claims. No `email_verified` gate (D-090) — provisioning is unconditional on first login for any method, since D-089 makes ownership of the email Heediq's own responsibility, not an IdP-asserted claim.
+- `src/handlers/auth-provision.ts` — Cognito PreTokenGeneration trigger (D-077/D-099): resolves `accountId` via `heediq-cognito-identities` first (deterministic); falls back to the `by-email` self-heal, pinning the mapping via `linkIdentity` for future logins; on a genuinely first login, generates a new app-owned `accountId` (`randomUUID`, decoupled from `sub`), seeds the org's RBAC roles via `ensureOrgRbacSeeded` (D-102), assigns the new admin user their role via `ensureUserRoleAssignment`, and writes org + user + identity mapping + initial auth-method + audit entries in one `Promise.all`. Always emits `custom:accountId`/`custom:orgId`/`custom:role`/`custom:permissions` claims — `custom:permissions` is `resolveEffectivePermissions()`'s output, JSON-stringified, baked into the token at issuance (D-105) rather than checked per-request against DynamoDB. No `email_verified` gate (D-090) — provisioning is unconditional on first login for any method, since D-089 makes ownership of the email Heediq's own responsibility, not an IdP-asserted claim.
 - `src/routes/auth-methods.ts` — authenticated `GET /api/v1/auth/methods` (D-091): lists the caller's active sign-in methods from `heediq-user-auth-methods`, scoped to their own `userId` (the `custom:accountId`-derived value, D-099)
 - `src/handlers/auth-trigger-pre-signup.ts` — Cognito PreSignUp trigger (`PreSignUp_ExternalProvider` only): links a new federated login onto a matching native account by email
 - `src/handlers/auth-trigger-post-confirmation.ts` — Cognito PostConfirmation trigger (`PostConfirmation_ConfirmSignUp` only): records the auth method + audit event only when an existing `accountId` can be positively resolved (identities table, then email self-heal). Fires before `auth-provision.ts`, so a genuinely new signup has no `accountId` yet (D-099) — rather than guess one, it skips the write entirely and defers the initial auth-method/audit entry to `auth-provision.ts`'s first-login branch.
 - `src/handlers/auth-trigger-post-authentication.ts` — Cognito PostAuthentication trigger (`PostAuthentication_Authentication` only): resolves the canonical `accountId` the same way `auth-provision.ts` will moments later (identities table first, D-099), records the auth method for the login just completed, self-heals by pinning an unresolved `sub` via `linkIdentity`, and auto-links a federated login to an existing native account with the same email if not yet linked
 - `src/lib/audit.ts` — `writeAuditEvent()` (D-102): calls `@heediq/shared`'s `buildAuditLogEntry()` then writes the entry via `PutCommand` against `config.dynamo.auditLogTable`; logs only ids/resourceType/action, never `before`/`after` payload bodies (D-093)
-- `src/routes/roles.ts` — Role CRUD (D-102): `GET/POST /api/v1/roles`, `GET/PATCH/DELETE /api/v1/roles/:id`; writes gated by `requireAdmin`; `DELETE` returns 409 for system roles (`isSystemRole: true`)
-- `src/routes/groups.ts` — Group CRUD (D-102): `GET/POST /api/v1/groups`, `GET/PATCH/DELETE /api/v1/groups/:id`; writes gated by `requireAdmin`; validates every `roleIds[]` entry exists in the org (`BatchGetCommand`) before create/update
-- `src/routes/role-assignments.ts` — Direct role/group assignment (D-102): `GET/POST /api/v1/users/:userId/role-assignments`, `DELETE /api/v1/users/:userId/role-assignments/role/:roleId` and `.../group/:groupId`; writes gated by `requireAdmin`; validates the target `roleId`/`groupId` exists in-org before assigning
+- `src/routes/roles.ts` — Role CRUD (D-102): `GET/POST /api/v1/roles`, `GET/PATCH/DELETE /api/v1/roles/:id`; writes gated by `requirePermission('org:manage-roles')` (D-105); `DELETE` returns 409 for system roles (`isSystemRole: true`)
+- `src/routes/groups.ts` — Group CRUD (D-102): `GET/POST /api/v1/groups`, `GET/PATCH/DELETE /api/v1/groups/:id`; writes gated by `requirePermission('org:manage-roles')` (D-105); validates every `roleIds[]` entry exists in the org (`BatchGetCommand`) before create/update
+- `src/routes/role-assignments.ts` — Direct role/group assignment (D-102): `GET/POST /api/v1/users/:userId/role-assignments`, `DELETE /api/v1/users/:userId/role-assignments/role/:roleId` and `.../group/:groupId`; writes gated by `requirePermission('org:manage-roles')` (D-105); validates the target `roleId`/`groupId` exists in-org before assigning
 
 ## Data Flow
 
@@ -69,34 +71,36 @@ POST   /api/v1/auth/link/confirm      { email, newPassword } -> { passwordSet: t
 GET    /api/v1/auth/methods           -> { methods: [{ provider, linkedAt }] }             (authenticated, D-091)
 
 GET    /api/v1/roles                                                                       (D-102)
-POST   /api/v1/roles                  { name, permissions[] }                              (D-102, admin-only)
+POST   /api/v1/roles                  { name, permissions[] }                              (D-102/D-105, requires org:manage-roles)
 GET    /api/v1/roles/:id                                                                    (D-102)
-PATCH  /api/v1/roles/:id              { name?, permissions? }                               (D-102, admin-only)
-DELETE /api/v1/roles/:id                                                                    (D-102, admin-only; 409 if isSystemRole)
+PATCH  /api/v1/roles/:id              { name?, permissions? }                               (D-102/D-105, requires org:manage-roles)
+DELETE /api/v1/roles/:id                                                                    (D-102/D-105, requires org:manage-roles; 409 if isSystemRole)
 
 GET    /api/v1/groups                                                                        (D-102)
-POST   /api/v1/groups                 { name, roleIds[] }                                    (D-102, admin-only)
+POST   /api/v1/groups                 { name, roleIds[] }                                    (D-102/D-105, requires org:manage-roles)
 GET    /api/v1/groups/:id                                                                    (D-102)
-PATCH  /api/v1/groups/:id             { name?, roleIds? }                                     (D-102, admin-only)
-DELETE /api/v1/groups/:id                                                                     (D-102, admin-only)
+PATCH  /api/v1/groups/:id             { name?, roleIds? }                                     (D-102/D-105, requires org:manage-roles)
+DELETE /api/v1/groups/:id                                                                     (D-102/D-105, requires org:manage-roles)
 
 GET    /api/v1/users/:userId/role-assignments                                                (D-102)
-POST   /api/v1/users/:userId/role-assignments  { assignmentType: 'role', roleId } | { assignmentType: 'group', groupId }  (D-102, admin-only)
-DELETE /api/v1/users/:userId/role-assignments/role/:roleId                                    (D-102, admin-only)
-DELETE /api/v1/users/:userId/role-assignments/group/:groupId                                  (D-102, admin-only)
+POST   /api/v1/users/:userId/role-assignments  { assignmentType: 'role', roleId } | { assignmentType: 'group', groupId }  (D-102/D-105, requires org:manage-roles)
+DELETE /api/v1/users/:userId/role-assignments/role/:roleId                                    (D-102/D-105, requires org:manage-roles)
+DELETE /api/v1/users/:userId/role-assignments/group/:groupId                                  (D-102/D-105, requires org:manage-roles)
 ```
 
-**D-102 RBAC & audit trail:** Roles, Groups, and direct/group-mediated Role Assignments are the
+**D-102/D-105 RBAC & audit trail:** Roles, Groups, and direct/group-mediated Role Assignments are the
 building blocks of D-102's permission model (effective permissions = union of every role reached
-directly or via group membership; no deny rules — see `@heediq/shared`'s `permissions.ts`). All
-write endpoints above are gated by an **interim** `requireAdmin(c)` check (`c.get('role') === 'admin'`,
-the legacy fixed org role from D-017) — full enforcement against the granular `Permission` catalog is
-a later phase, not yet wired to these routes. `groups.ts` validates every `roleIds[]` entry exists in
-the org via `BatchGetCommand` before create/update; `role-assignments.ts` validates the target
-`roleId`/`groupId` exists in-org via `GetCommand` before writing an assignment. `roles.ts`'s `DELETE`
-refuses to remove a system role (`isSystemRole: true`, e.g. `admin`/`member`) with `409 CONFLICT`.
-Every write (create/update/delete on roles, groups, and assignments) writes an audit entry via
-`writeAuditEvent()` — see `src/lib/audit.ts` above and the Gotchas section below.
+directly or via group membership; no deny rules — see `@heediq/shared`'s `permissions.ts`). All write
+endpoints above are gated by `requirePermission('org:manage-roles')` (`src/middleware/rbac.ts`), a
+pure in-token check against the `permissions` array parsed from the `custom:permissions` JWT claim —
+no DynamoDB read per request. Permissions are computed once, at token issuance, by
+`resolveEffectivePermissions()` in `auth-provision.ts` (D-105 supersedes D-102's original
+`rbacVersion`/staleness-check design; see `DECISIONS.md`). `groups.ts` validates every `roleIds[]`
+entry exists in the org via `BatchGetCommand` before create/update; `role-assignments.ts` validates
+the target `roleId`/`groupId` exists in-org via `GetCommand` before writing an assignment. `roles.ts`'s
+`DELETE` refuses to remove a system role (`isSystemRole: true`, e.g. `admin`/`member`) with
+`409 CONFLICT`. Every write (create/update/delete on roles, groups, and assignments) writes an audit
+entry via `writeAuditEvent()` — see `src/lib/audit.ts` above and the Gotchas section below.
 
 **D-087/D-089 linking flow:** `request-otp` calls Cognito `SignUp` (creating a native `UNCONFIRMED` user so Cognito emails its own verification code) or falls back to `ResendConfirmationCode` if the native user already exists mid-flow. If that existing native user is stuck `CONFIRMED` but never had a password set (abandoned between the `verify-otp` and `confirm` screens — D-096, since Cognito permanently refuses to resend a code to a `CONFIRMED` user), it self-heals by deleting that orphaned user (`AdminDeleteUser`) and re-running `SignUp` so a fresh code goes out; a `CONFIRMED` user that *does* have a password set (`passwordSet: true` in `heediq-users`) is a real linked account and is left untouched. It always returns `{ sent: true }` regardless of outcome to avoid account-existence enumeration. `verify-otp` calls `ConfirmSignUp` on its own, before any password is collected (D-089) — any failure (including `NotAuthorizedException` from an already-confirmed/non-`UNCONFIRMED` account) is rejected as an invalid code, never bypassed; the code is consumed here and is never sent again. `confirm` is called only after `verify-otp` has already succeeded — it first rejects with `WEAK_PASSWORD` if `@heediq/shared`'s `isPasswordPolicyCompliant` fails (no Cognito round trip, D-094), then calls `AdminSetUserPassword` (an `InvalidPasswordException` here also returns `WEAK_PASSWORD` — the authoritative backstop for policy checks the shared function can't see, e.g. password-history reuse), then `AdminLinkProviderForUser` for every external-provider user found for that email, and records the auth method once linking succeeds.
 
@@ -152,7 +156,7 @@ new router follows the same pattern — mount it in `app.ts`, don't hardcode the
 ## Testing
 
 ```bash
-pnpm run test          # 138 unit tests (auth routes + auth methods + auth triggers + sources + app routing + rate limiting + roles + groups + role-assignments)
+pnpm run test          # 151 unit tests (auth routes + auth methods + auth triggers + sources + app routing + rate limiting + roles + groups + role-assignments + rbac + rbac-middleware)
 pnpm run typecheck     # tsc --noEmit
 pnpm run test:pre-pr   # typecheck + test (run before opening a PR)
 pnpm run dev           # local dev server on :3000 (tsx watch)
@@ -190,4 +194,4 @@ Integration tests (Vitest + DynamoDB Local) — to be added once the integration
 - **The 3 `auth-trigger-*.ts` handlers are separate bundled Lambda entry points**, not part of the main API Lambda — each has its own `bundle:auth-trigger-*` esbuild script and its own deploy step in `deploy.yml` per environment, same pattern as `auth-provision.ts`.
 - **`custom:accountId` (D-099) required a full Cognito User Pool replacement:** adding a custom attribute changes the User Pool's `Schema`, which CloudFormation can only apply via full resource replacement — this destroys all existing users in whichever environment it's deployed to. Confirmed and accepted for dev; requires explicit sign-off before staging/prod (existing users would need to re-sign-up).
 - **D-102 audit log table is write-only from this API:** `writeAuditEvent()` only ever `PutCommand`s into `heediq-audit-log`; no route reads it back yet (`audit:read` exists in the `Permission` catalog but has no endpoint). The table's `by-user` GSI is provisioned and ready for that read path.
-- **D-102 admin gating is interim:** every RBAC write route (`roles.ts`, `groups.ts`, `role-assignments.ts`) checks only the legacy fixed `role === 'admin'` claim (D-017), not the new granular `Permission` catalog — a future phase wires real permission-based enforcement (e.g. `org:manage-roles`) in place of `requireAdmin()`.
+- **D-105 permission staleness is bounded by token lifetime, not instant:** since `custom:permissions` is baked into the JWT at issuance rather than checked per-request against DynamoDB, a permission change (role edit, reassignment) only takes effect for a given user on their next token refresh — not immediately. This is a deliberate tradeoff (see `DECISIONS.md` D-105) in exchange for zero added DynamoDB reads on the request hot path.

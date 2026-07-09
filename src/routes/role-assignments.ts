@@ -1,10 +1,11 @@
-import { Hono, type Context } from 'hono'
+import { Hono } from 'hono'
 import { GetCommand, PutCommand, DeleteCommand, QueryCommand } from '@aws-sdk/lib-dynamodb'
 import { dynamo } from '../lib/dynamo.js'
 import { writeAuditEvent } from '../lib/audit.js'
 import { apiError, ok } from '../lib/errors.js'
 import { config } from '../config.js'
 import type { AuthContext } from '../middleware/auth.js'
+import { requirePermission } from '../middleware/rbac.js'
 import type { RequestIdContext } from '../middleware/request-id.js'
 import {
   RoleAssignmentSchema,
@@ -25,11 +26,6 @@ function isAwsError(err: unknown): err is { name: string } {
   return typeof err === 'object' && err !== null && 'name' in err
 }
 
-// Interim write gate — see roles.ts for rationale (D-102 permission enforcement lands later).
-function requireAdmin(c: Context<RoleAssignmentsContext>): boolean {
-  return c.get('role') === 'admin'
-}
-
 // GET /api/v1/users/:userId/role-assignments — list a user's direct role/group assignments
 roleAssignments.get('/:userId/role-assignments', async (c) => {
   const orgId = c.get('orgId')
@@ -43,11 +39,8 @@ roleAssignments.get('/:userId/role-assignments', async (c) => {
   return ok(c, { roleAssignments: items })
 })
 
-// POST /api/v1/users/:userId/role-assignments — assign a role or group (admin-only)
-roleAssignments.post('/:userId/role-assignments', async (c) => {
-  if (!requireAdmin(c)) {
-    return apiError(c, 'FORBIDDEN', 'Only org admins can manage role assignments')
-  }
+// POST /api/v1/users/:userId/role-assignments — assign a role or group
+roleAssignments.post('/:userId/role-assignments', requirePermission('org:manage-roles'), async (c) => {
   const orgId = c.get('orgId')
   const targetUserId = c.req.param('userId')
   const body = await c.req.json()
@@ -123,11 +116,8 @@ roleAssignments.post('/:userId/role-assignments', async (c) => {
   return ok(c, { roleAssignment: assignment }, 201)
 })
 
-// DELETE /api/v1/users/:userId/role-assignments/role/:roleId — unassign a direct role (admin-only)
-roleAssignments.delete('/:userId/role-assignments/role/:roleId', async (c) => {
-  if (!requireAdmin(c)) {
-    return apiError(c, 'FORBIDDEN', 'Only org admins can manage role assignments')
-  }
+// DELETE /api/v1/users/:userId/role-assignments/role/:roleId — unassign a direct role
+roleAssignments.delete('/:userId/role-assignments/role/:roleId', requirePermission('org:manage-roles'), async (c) => {
   const orgId = c.get('orgId')
   const targetUserId = c.req.param('userId')
   const roleId = c.req.param('roleId')
@@ -172,11 +162,8 @@ roleAssignments.delete('/:userId/role-assignments/role/:roleId', async (c) => {
   return ok(c, { deleted: true })
 })
 
-// DELETE /api/v1/users/:userId/role-assignments/group/:groupId — unassign a group (admin-only)
-roleAssignments.delete('/:userId/role-assignments/group/:groupId', async (c) => {
-  if (!requireAdmin(c)) {
-    return apiError(c, 'FORBIDDEN', 'Only org admins can manage role assignments')
-  }
+// DELETE /api/v1/users/:userId/role-assignments/group/:groupId — unassign a group
+roleAssignments.delete('/:userId/role-assignments/group/:groupId', requirePermission('org:manage-roles'), async (c) => {
   const orgId = c.get('orgId')
   const targetUserId = c.req.param('userId')
   const groupId = c.req.param('groupId')
