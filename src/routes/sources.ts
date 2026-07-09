@@ -38,7 +38,10 @@ function isAwsError(err: unknown): err is { name: string } {
 sources.get('/', async (c) => {
   const orgId = c.get('orgId')
   const userId = c.get('userId')
-  const role = c.get('role')
+  // D-102 Phase 4: scoped to the caller's own sources whenever they lack org-wide read —
+  // follows the actual granted permission rather than a hardcoded role name, so a custom role
+  // built without sources:read also gets scoped correctly (not just the built-in `member` role).
+  const ownSourcesOnly = !c.get('permissions').includes('sources:read')
   const limit = Math.min(Number(c.req.query('limit') ?? 20), 100)
   const cursor = c.req.query('cursor')
 
@@ -48,9 +51,9 @@ sources.get('/', async (c) => {
     KeyConditionExpression: 'orgId = :orgId',
     ExpressionAttributeValues: {
       ':orgId': orgId,
-      ...(role === 'member' && { ':userId': userId }),
+      ...(ownSourcesOnly && { ':userId': userId }),
     },
-    FilterExpression: role === 'member' ? 'userId = :userId' : undefined,
+    FilterExpression: ownSourcesOnly ? 'userId = :userId' : undefined,
     Limit: limit + 1,
     ExclusiveStartKey: cursor ? JSON.parse(Buffer.from(cursor, 'base64url').toString()) : undefined,
     ScanIndexForward: false,

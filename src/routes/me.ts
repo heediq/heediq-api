@@ -24,6 +24,10 @@ me.get('/', async (c) => {
   return ok(c, {
     user: UserSchema.parse(userRes.Item),
     org: OrgSchema.parse(orgRes.Item),
+    // D-102/D-105: the server-resolved permission set, already parsed by authMiddleware from the
+    // custom:permissions JWT claim — the frontend's only source of authority for usePermissions/<Can>,
+    // never a client-side JWT decode.
+    effectivePermissions: c.get('permissions'),
   })
 })
 
