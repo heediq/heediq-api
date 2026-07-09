@@ -68,6 +68,7 @@ describe('authMiddleware', () => {
         'custom:orgId': 'org-1',
         email: 'a@b.com',
         'custom:role': 'member',
+        'custom:permissions': JSON.stringify(['sources:read-own']),
       },
       protectedHeader: { alg: 'RS256' },
     } as Awaited<ReturnType<typeof jwtVerify>>)
@@ -97,9 +98,48 @@ describe('authMiddleware', () => {
     expect(body.error.message).toMatch(/missing required claims/i)
   })
 
-  it('returns 401 when token is missing other required claims (orgId, email, role)', async () => {
+  it('returns 401 when token is missing other required claims (orgId, email, role, permissions)', async () => {
     vi.mocked(jwtVerify).mockResolvedValueOnce({
-      payload: { sub: 'user-1', 'custom:accountId': 'account-1' }, // missing orgId, email, role
+      payload: { sub: 'user-1', 'custom:accountId': 'account-1' }, // missing orgId, email, role, permissions
+      protectedHeader: { alg: 'RS256' },
+    } as Awaited<ReturnType<typeof jwtVerify>>)
+
+    const res = await app.request('/test', { headers: { Authorization: 'Bearer valid-token' } })
+    expect(res.status).toBe(401)
+  })
+
+  // D-105: custom:permissions is baked in at token issuance alongside custom:role — a token
+  // predating this rollout, or one that's been tampered with, must be rejected rather than
+  // silently treated as having no permissions.
+  it('returns 401 when custom:permissions is malformed JSON', async () => {
+    vi.mocked(jwtVerify).mockResolvedValueOnce({
+      payload: {
+        sub: 'raw-cognito-sub',
+        'custom:accountId': 'account-1',
+        'custom:orgId': 'org-1',
+        email: 'a@b.com',
+        'custom:role': 'member',
+        'custom:permissions': 'not-json',
+      },
+      protectedHeader: { alg: 'RS256' },
+    } as Awaited<ReturnType<typeof jwtVerify>>)
+
+    const res = await app.request('/test', { headers: { Authorization: 'Bearer valid-token' } })
+    expect(res.status).toBe(401)
+    const body = await res.json() as { error: { message: string } }
+    expect(body.error.message).toMatch(/malformed permissions/i)
+  })
+
+  it('returns 401 when custom:permissions contains an unknown permission string', async () => {
+    vi.mocked(jwtVerify).mockResolvedValueOnce({
+      payload: {
+        sub: 'raw-cognito-sub',
+        'custom:accountId': 'account-1',
+        'custom:orgId': 'org-1',
+        email: 'a@b.com',
+        'custom:role': 'member',
+        'custom:permissions': JSON.stringify(['not-a-real-permission']),
+      },
       protectedHeader: { alg: 'RS256' },
     } as Awaited<ReturnType<typeof jwtVerify>>)
 

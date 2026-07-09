@@ -1,4 +1,4 @@
-import { Hono, type Context } from 'hono'
+import { Hono } from 'hono'
 import { GetCommand, PutCommand, UpdateCommand, DeleteCommand, QueryCommand } from '@aws-sdk/lib-dynamodb'
 import { randomUUID } from 'crypto'
 import { dynamo } from '../lib/dynamo.js'
@@ -6,6 +6,7 @@ import { writeAuditEvent } from '../lib/audit.js'
 import { apiError, ok } from '../lib/errors.js'
 import { config } from '../config.js'
 import type { AuthContext } from '../middleware/auth.js'
+import { requirePermission } from '../middleware/rbac.js'
 import type { RequestIdContext } from '../middleware/request-id.js'
 import { RoleSchema, CreateRoleRequestSchema, UpdateRoleRequestSchema, createLogger, type Role } from '@heediq/shared'
 
@@ -17,12 +18,6 @@ const roles = new Hono<RolesContext>()
 
 function isAwsError(err: unknown): err is { name: string } {
   return typeof err === 'object' && err !== null && 'name' in err
-}
-
-// Interim write gate — D-102 ships role-based permission enforcement in a later phase;
-// until then, writes are gated on the legacy fixed `admin` role only (approved interim scope).
-function requireAdmin(c: Context<RolesContext>): boolean {
-  return c.get('role') === 'admin'
 }
 
 // GET /api/v1/roles — list org roles
@@ -37,11 +32,8 @@ roles.get('/', async (c) => {
   return ok(c, { roles: items })
 })
 
-// POST /api/v1/roles — create role (admin-only)
-roles.post('/', async (c) => {
-  if (!requireAdmin(c)) {
-    return apiError(c, 'FORBIDDEN', 'Only org admins can manage roles')
-  }
+// POST /api/v1/roles — create role
+roles.post('/', requirePermission('org:manage-roles'), async (c) => {
   const orgId = c.get('orgId')
   const body = await c.req.json()
   const parsed = CreateRoleRequestSchema.safeParse(body)
@@ -91,11 +83,8 @@ roles.get('/:id', async (c) => {
   return ok(c, { role: RoleSchema.parse(res.Item) })
 })
 
-// PATCH /api/v1/roles/:id — admin-only
-roles.patch('/:id', async (c) => {
-  if (!requireAdmin(c)) {
-    return apiError(c, 'FORBIDDEN', 'Only org admins can manage roles')
-  }
+// PATCH /api/v1/roles/:id
+roles.patch('/:id', requirePermission('org:manage-roles'), async (c) => {
   const orgId = c.get('orgId')
   const id = c.req.param('id')
   const body = await c.req.json()
@@ -157,11 +146,8 @@ roles.patch('/:id', async (c) => {
   return ok(c, { role: after })
 })
 
-// DELETE /api/v1/roles/:id — admin-only; system roles (admin/member) cannot be deleted
-roles.delete('/:id', async (c) => {
-  if (!requireAdmin(c)) {
-    return apiError(c, 'FORBIDDEN', 'Only org admins can manage roles')
-  }
+// DELETE /api/v1/roles/:id — system roles (admin/member) cannot be deleted
+roles.delete('/:id', requirePermission('org:manage-roles'), async (c) => {
   const orgId = c.get('orgId')
   const id = c.req.param('id')
   const key = { pk: `ORG#${orgId}`, sk: `ROLE#${id}` }

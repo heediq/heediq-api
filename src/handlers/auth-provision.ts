@@ -3,6 +3,7 @@ import type { PreTokenGenerationTriggerHandler } from 'aws-lambda'
 import { GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb'
 import { dynamo } from '../lib/dynamo.js'
 import { resolveAccountIdBySub, resolveAccountIdByEmail, linkIdentity } from '../lib/accountIdentity.js'
+import { ensureOrgRbacSeeded, ensureUserRoleAssignment, resolveEffectivePermissions, type RbacTables } from '../lib/rbac.js'
 import { createLogger, type OrgRole } from '@heediq/shared'
 
 // Separate Lambda entry point (own env vars, not the full API config) — this fires on every
@@ -18,6 +19,11 @@ const USERS_TABLE = requireEnv('USERS_TABLE_NAME')
 const IDENTITIES_TABLE = requireEnv('COGNITO_IDENTITIES_TABLE_NAME')
 const USER_AUTH_METHODS_TABLE = requireEnv('USER_AUTH_METHODS_TABLE_NAME')
 const AUTH_AUDIT_LOG_TABLE = requireEnv('AUTH_AUDIT_LOG_TABLE_NAME')
+const RBAC_TABLES: RbacTables = {
+  rolesTable: requireEnv('ROLES_TABLE_NAME'),
+  groupsTable: requireEnv('GROUPS_TABLE_NAME'),
+  roleAssignmentsTable: requireEnv('ROLE_ASSIGNMENTS_TABLE_NAME'),
+}
 const logger = createLogger('heediq-api')
 
 function providerFromIdentitiesAttr(raw: string | undefined): { providerName: string; providerSub: string } | null {
@@ -47,13 +53,19 @@ export const handler: PreTokenGenerationTriggerHandler = async (event) => {
   if (accountId) {
     const user = await dynamo.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId: accountId } }))
     if (user.Item) {
+      const orgId = user.Item['orgId'] as string
+      const permissions = await resolveEffectivePermissions(RBAC_TABLES, orgId, accountId)
       logger.info('Existing user resolved via identities table', { sub, accountId })
       event.response = {
         claimsOverrideDetails: {
           claimsToAddOrOverride: {
             'custom:accountId': accountId,
-            'custom:orgId': user.Item['orgId'] as string,
+            'custom:orgId': orgId,
             'custom:role': user.Item['role'] as OrgRole,
+            // JSON-stringified Permission[] (D-105) — baked in at token issuance, same
+            // trust model as custom:role; refreshed on every token refresh, no per-request
+            // DB read on the request path.
+            'custom:permissions': JSON.stringify(permissions),
           },
         },
       }
@@ -72,14 +84,19 @@ export const handler: PreTokenGenerationTriggerHandler = async (event) => {
   if (existingAccountId) {
     const user = await dynamo.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId: existingAccountId } }))
     if (user.Item) {
-      await linkIdentity(IDENTITIES_TABLE, sub, existingAccountId)
+      const orgId = user.Item['orgId'] as string
+      const [, permissions] = await Promise.all([
+        linkIdentity(IDENTITIES_TABLE, sub, existingAccountId),
+        resolveEffectivePermissions(RBAC_TABLES, orgId, existingAccountId),
+      ])
       logger.info('Existing user resolved and identity linked via email self-heal', { sub, accountId: existingAccountId })
       event.response = {
         claimsOverrideDetails: {
           claimsToAddOrOverride: {
             'custom:accountId': existingAccountId,
-            'custom:orgId': user.Item['orgId'] as string,
+            'custom:orgId': orgId,
             'custom:role': user.Item['role'] as OrgRole,
+            'custom:permissions': JSON.stringify(permissions),
           },
         },
       }
@@ -104,6 +121,10 @@ export const handler: PreTokenGenerationTriggerHandler = async (event) => {
   const providerContext = providerFromIdentitiesAttr(event.request.userAttributes['identities'])
   const providerName = providerContext?.providerName ?? 'COGNITO'
   const providerSub = providerContext?.providerSub ?? sub
+
+  // Seeds admin/member system roles for the new org (D-102) — must complete before the role
+  // assignment below, which references the seeded admin roleId.
+  const seededRoles = await ensureOrgRbacSeeded(RBAC_TABLES, orgId)
 
   await Promise.all([
     dynamo.send(new PutCommand({
@@ -149,6 +170,7 @@ export const handler: PreTokenGenerationTriggerHandler = async (event) => {
         details: 'New org and account provisioned at first login',
       },
     })),
+    ensureUserRoleAssignment(RBAC_TABLES, orgId, newAccountId, seededRoles.admin.roleId),
   ])
 
   logger.info('New org provisioned at first login', { sub, accountId: newAccountId, orgId, federated: isFederatedLogin(event) })
@@ -158,6 +180,9 @@ export const handler: PreTokenGenerationTriggerHandler = async (event) => {
         'custom:accountId': newAccountId,
         'custom:orgId': orgId,
         'custom:role': role,
+        // Admin gets every permission by seed definition (D-102) — no need to re-resolve via
+        // a role-assignment query right after writing it.
+        'custom:permissions': JSON.stringify(seededRoles.admin.permissions),
       },
     },
   }
