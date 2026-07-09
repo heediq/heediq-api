@@ -11,6 +11,7 @@ import { authMethodsRouter } from './routes/auth-methods.js'
 import { rolesRouter } from './routes/roles.js'
 import { groupsRouter } from './routes/groups.js'
 import { roleAssignmentsRouter } from './routes/role-assignments.js'
+import { usersRouter } from './routes/users.js'
 import { config } from './config.js'
 import { apiError } from './lib/errors.js'
 
@@ -48,6 +49,10 @@ v1.route('/groups', groupsRouter)
 // than being mounted under a parent `:userId` segment) so Hono's route-param typing recognizes
 // `userId` within the router — a parent-level param isn't visible to a Hono sub-app's own types.
 v1.route('/users', roleAssignmentsRouter)
+// D-102 Phase 4: org-scoped user list for the role/group assignment screen. Internal path is
+// `/` (vs roleAssignmentsRouter's `/:userId/role-assignments...`) so the two routers compose
+// on the same `/users` prefix without colliding.
+v1.route('/users', usersRouter)
 
 app.route('/api/v1', v1)
 

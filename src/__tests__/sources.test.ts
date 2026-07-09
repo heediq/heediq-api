@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { Hono } from 'hono'
+import { DEFAULT_ORG_RBAC_SEED, type Permission } from '@heediq/shared'
 import type { AuthContext } from '../middleware/auth.js'
 
 const mockDynamoSend = vi.hoisted(() => vi.fn())
@@ -39,13 +40,14 @@ vi.mock('@aws-sdk/s3-request-presigner', () => ({
 
 import { sourcesRouter } from '../routes/sources.js'
 
-function makeApp(role: 'admin' | 'member' = 'admin') {
+function makeApp(role: 'admin' | 'member' = 'admin', permissions?: Permission[]) {
   const app = new Hono<AuthContext>()
   app.use('*', async (c, next) => {
     c.set('userId', userId)
     c.set('orgId', orgId)
     c.set('email', 'a@b.com')
     c.set('role', role)
+    c.set('permissions', permissions ?? [...DEFAULT_ORG_RBAC_SEED[role].permissions])
     await next()
   })
   app.route('/', sourcesRouter)
@@ -76,6 +78,42 @@ describe('GET /sources', () => {
     await makeApp().request('/')
     expect(mockDynamoSend).toHaveBeenCalledWith(
       expect.objectContaining({ input: expect.objectContaining({ IndexName: 'by-org-created' }) }),
+    )
+  })
+
+  it('scopes to own sources for a member caller (permission-derived, not the role name)', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Items: [] })
+    await makeApp('member').request('/')
+    expect(mockDynamoSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.objectContaining({
+          FilterExpression: 'userId = :userId',
+          ExpressionAttributeValues: expect.objectContaining({ ':userId': userId }),
+        }),
+      }),
+    )
+  })
+
+  it('scopes to own sources for a custom role with only sources:read-own (D-102 Phase 4 regression) — the filter follows the granted permission, not a hardcoded "member" role check', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Items: [] })
+    await makeApp('member', ['sources:read-own', 'sources:create']).request('/')
+    expect(mockDynamoSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.objectContaining({
+          FilterExpression: 'userId = :userId',
+          ExpressionAttributeValues: expect.objectContaining({ ':userId': userId }),
+        }),
+      }),
+    )
+  })
+
+  it('does not scope to own sources for a custom role granted org-wide sources:read', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Items: [] })
+    await makeApp('member', ['sources:read']).request('/')
+    expect(mockDynamoSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.objectContaining({ FilterExpression: undefined }),
+      }),
     )
   })
 })
