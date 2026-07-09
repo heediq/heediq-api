@@ -17,7 +17,8 @@ All Heediq REST endpoints in a single Lambda function. Handles auth, Source CRUD
 - `src/middleware/request-id.ts` — correlation ID middleware (D-085): reads `X-Request-Id` from the caller or generates a UUID, sets it on context, and echoes it back as a response header
 - `src/lib/errors.ts` — `apiError()` / `ok()` response helpers with consistent envelope (D-033)
 - `src/lib/dynamo.ts` — DynamoDB Document Client singleton
-- `src/routes/me.ts` — `GET /api/v1/me`
+- `src/routes/me.ts` — `GET /api/v1/me`; response includes `effectivePermissions` (D-102/D-105), the server-resolved permission set already parsed by `authMiddleware` from the `custom:permissions` JWT claim — the only source of authority `heediq-web`'s `usePermissions`/`<Can>` are allowed to read
+- `src/routes/users.ts` — `GET /api/v1/users` — org-scoped user list (D-102 Phase 4), used by the role/group assignment screen; read-open to any authenticated org member, same posture as `GET /roles`/`GET /groups`
 - `src/routes/sources.ts` — Source CRUD + job enqueue + summary fetch (D-068)
 - `src/routes/upload.ts` — `POST /api/v1/upload/presign` (S3 presigned URL)
 - `src/routes/auth.ts` — unauthenticated `/api/v1/auth` sub-app: `lookup-email` + D-087/D-089 cross-provider linking (`link/request-otp`, `link/verify-otp`, `link/confirm`)
@@ -54,7 +55,8 @@ All request/response shapes defined in `@heediq/shared` (D-033). API prefix: `/a
 
 **Endpoints:**
 ```
-GET    /api/v1/me
+GET    /api/v1/me                     -> { user, org, effectivePermissions }                (D-102/D-105)
+GET    /api/v1/users                  -> { users: User[] }  (org-scoped, D-102 Phase 4)
 GET    /api/v1/sources?limit=20&cursor=<b64>
 POST   /api/v1/sources                { title, durationSecs? }
 GET    /api/v1/sources/:id
@@ -156,7 +158,7 @@ new router follows the same pattern — mount it in `app.ts`, don't hardcode the
 ## Testing
 
 ```bash
-pnpm run test          # 151 unit tests (auth routes + auth methods + auth triggers + sources + app routing + rate limiting + roles + groups + role-assignments + rbac + rbac-middleware)
+pnpm run test          # 160 unit tests (auth routes + auth methods + auth triggers + sources + app routing + rate limiting + roles + groups + role-assignments + rbac + rbac-middleware + me + users)
 pnpm run typecheck     # tsc --noEmit
 pnpm run test:pre-pr   # typecheck + test (run before opening a PR)
 pnpm run dev           # local dev server on :3000 (tsx watch)
