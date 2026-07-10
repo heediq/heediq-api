@@ -12,6 +12,7 @@ import { rolesRouter } from './routes/roles.js'
 import { groupsRouter } from './routes/groups.js'
 import { roleAssignmentsRouter } from './routes/role-assignments.js'
 import { usersRouter } from './routes/users.js'
+import { auditLogRouter } from './routes/audit-log.js'
 import { config } from './config.js'
 import { apiError } from './lib/errors.js'
 
@@ -53,6 +54,8 @@ v1.route('/users', roleAssignmentsRouter)
 // `/` (vs roleAssignmentsRouter's `/:userId/role-assignments...`) so the two routers compose
 // on the same `/users` prefix without colliding.
 v1.route('/users', usersRouter)
+// D-102 Phase 5: audit-log viewer, gated by `requirePermission('audit:read')` inside the router.
+v1.route('/org/audit-log', auditLogRouter)
 
 app.route('/api/v1', v1)
 
