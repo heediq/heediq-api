@@ -33,6 +33,7 @@ All Heediq REST endpoints in a single Lambda function. Handles auth, Source CRUD
 - `src/routes/roles.ts` — Role CRUD (D-102): `GET/POST /api/v1/roles`, `GET/PATCH/DELETE /api/v1/roles/:id`; writes gated by `requirePermission('org:manage-roles')` (D-105); `DELETE` returns 409 for system roles (`isSystemRole: true`)
 - `src/routes/groups.ts` — Group CRUD (D-102): `GET/POST /api/v1/groups`, `GET/PATCH/DELETE /api/v1/groups/:id`; writes gated by `requirePermission('org:manage-roles')` (D-105); validates every `roleIds[]` entry exists in the org (`BatchGetCommand`) before create/update
 - `src/routes/role-assignments.ts` — Direct role/group assignment (D-102): `GET/POST /api/v1/users/:userId/role-assignments`, `DELETE /api/v1/users/:userId/role-assignments/role/:roleId` and `.../group/:groupId`; writes gated by `requirePermission('org:manage-roles')` (D-105); validates the target `roleId`/`groupId` exists in-org before assigning
+- `src/routes/audit-log.ts` — `GET /api/v1/org/audit-log` (D-102 Phase 5): cursor-paginated read path over `heediq-audit-log`, gated by `requirePermission('audit:read')`; filterable by `from`/`to`, `action`, `resourceType`, and `actorUserId` (routes to the `by-user` GSI, re-asserting `orgId` via `FilterExpression` as cross-org defense-in-depth)
 
 ## Data Flow
 
@@ -88,6 +89,8 @@ GET    /api/v1/users/:userId/role-assignments                                   
 POST   /api/v1/users/:userId/role-assignments  { assignmentType: 'role', roleId } | { assignmentType: 'group', groupId }  (D-102/D-105, requires org:manage-roles)
 DELETE /api/v1/users/:userId/role-assignments/role/:roleId                                    (D-102/D-105, requires org:manage-roles)
 DELETE /api/v1/users/:userId/role-assignments/group/:groupId                                  (D-102/D-105, requires org:manage-roles)
+
+GET    /api/v1/org/audit-log?limit=20&cursor=<b64>&from=<iso>&to=<iso>&action=<str>&resourceType=<str>&actorUserId=<str>   (D-102 Phase 5, requires audit:read)
 ```
 
 **D-102/D-105 RBAC & audit trail:** Roles, Groups, and direct/group-mediated Role Assignments are the
@@ -195,5 +198,5 @@ Integration tests (Vitest + DynamoDB Local) — to be added once the integration
 - **Deploy:** CI builds via `pnpm run bundle` (esbuild) and runs `aws lambda update-function-code` per environment, gated by the D-070/D-071 org-level `vars.AWS_REGION` / `vars.DEPLOY_ROLE_ARN`. See `heediq-infra/README.md` §"Initial Setup" for CDK-bootstrap prerequisites (Lambda + API Gateway must be deployed by CDK before this repo's CI can update function code).
 - **The 3 `auth-trigger-*.ts` handlers are separate bundled Lambda entry points**, not part of the main API Lambda — each has its own `bundle:auth-trigger-*` esbuild script and its own deploy step in `deploy.yml` per environment, same pattern as `auth-provision.ts`.
 - **`custom:accountId` (D-099) required a full Cognito User Pool replacement:** adding a custom attribute changes the User Pool's `Schema`, which CloudFormation can only apply via full resource replacement — this destroys all existing users in whichever environment it's deployed to. Confirmed and accepted for dev; requires explicit sign-off before staging/prod (existing users would need to re-sign-up).
-- **D-102 audit log table is write-only from this API:** `writeAuditEvent()` only ever `PutCommand`s into `heediq-audit-log`; no route reads it back yet (`audit:read` exists in the `Permission` catalog but has no endpoint). The table's `by-user` GSI is provisioned and ready for that read path.
+- **D-102 Phase 5 audit-log read path (`routes/audit-log.ts`):** `GET /org/audit-log` queries the base table (`pk = ORG#<orgId>`) by default, or the `by-user` GSI when `actorUserId` is given — the GSI query always adds `orgId = :orgId` to the `FilterExpression` too, as explicit cross-org defense-in-depth even though a user belongs to exactly one org today. The Lambda's IAM grant on this table is `Query` + write only — `GetItem`/`Scan` remain blocked (`heediq-infra` `api-stack.ts`), preserving the "no full-table read" posture from Phase 2.
 - **D-105 permission staleness is bounded by token lifetime, not instant:** since `custom:permissions` is baked into the JWT at issuance rather than checked per-request against DynamoDB, a permission change (role edit, reassignment) only takes effect for a given user on their next token refresh — not immediately. This is a deliberate tradeoff (see `DECISIONS.md` D-105) in exchange for zero added DynamoDB reads on the request hot path.
