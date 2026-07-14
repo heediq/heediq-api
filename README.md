@@ -153,7 +153,7 @@ new router follows the same pattern — mount it in `app.ts`, don't hardcode the
 ## Dependencies
 
 - Upstream: `heediq-infra` (Lambda + API Gateway + DynamoDB + S3 + SQS must exist before deploy, D-050)
-- Upstream: `@heediq/shared` (Zod schemas + types, D-033) — pinned to `^0.10.0` (D-085/D-093 `createLogger` structured logger, mandatory per D-093; `passwordPolicy.ts`'s `isPasswordPolicyCompliant` is consumed in `routes/auth.ts`'s `/link/confirm`, D-094; D-102 adds the 5 RBAC request schemas and `buildAuditLogEntry()`, consumed by `routes/roles.ts`/`groups.ts`/`role-assignments.ts` and `lib/audit.ts`)
+- Upstream: `@heediq/shared` (Zod schemas + types, D-033) — pinned to `^0.11.0` (D-085/D-093 `createLogger` structured logger, mandatory per D-093; `passwordPolicy.ts`'s `isPasswordPolicyCompliant` is consumed in `routes/auth.ts`'s `/link/confirm`, D-094; D-102 adds the 5 RBAC request schemas and `buildAuditLogEntry()`, consumed by `routes/roles.ts`/`groups.ts`/`role-assignments.ts` and `lib/audit.ts`)
 - Downstream: `heediq-worker-transcription` (reads SQS messages enqueued here). `config.ts` also reads `SUMMARIZATION_QUEUE_URL`, but no route currently sends to it — the text-upload → summarization-queue direct path isn't wired up yet.
 - Shared surfaces: `heediq-sources`, `heediq-jobs` DynamoDB tables
 - Upstream (auth): `heediq-infra`'s `UserAuthMethodsTable`/`AuthAuditLogTable` (D-087) and the Cognito User Pool triggers wired to the 3 `auth-trigger-*.ts` handlers — see `heediq-infra/README.md`
@@ -162,7 +162,7 @@ new router follows the same pattern — mount it in `app.ts`, don't hardcode the
 ## Testing
 
 ```bash
-pnpm run test          # 160 unit tests (auth routes + auth methods + auth triggers + sources + app routing + rate limiting + roles + groups + role-assignments + rbac + rbac-middleware + me + users)
+pnpm run test          # 167 unit tests (auth routes + auth methods + auth triggers + sources + app routing + rate limiting + roles + groups + role-assignments + rbac + rbac-middleware + me + users)
 pnpm run typecheck     # tsc --noEmit
 pnpm run test:pre-pr   # typecheck + test (run before opening a PR)
 pnpm run dev           # local dev server on :3000 (tsx watch)
