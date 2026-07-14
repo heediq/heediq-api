@@ -49,6 +49,7 @@ function makeEntry(overrides: Record<string, unknown> = {}) {
     timestamp: now,
     actorUserId: userId,
     actorEmail: 'admin@acme.com',
+    actorRole: 'admin',
     action: 'create',
     resourceType: 'role',
     after: { roleId: eventId, name: 'Reviewer', permissions: [], isSystemRole: false },

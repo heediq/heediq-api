@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { GetCommand, PutCommand, DeleteCommand, QueryCommand } from '@aws-sdk/lib-dynamodb'
 import { dynamo } from '../lib/dynamo.js'
-import { writeAuditEvent } from '../lib/audit.js'
+import { auditWriter } from '../lib/audit.js'
 import { apiError, ok } from '../lib/errors.js'
 import { config } from '../config.js'
 import type { AuthContext } from '../middleware/auth.js'
@@ -78,12 +78,9 @@ roleAssignments.post('/:userId/role-assignments', requirePermission('org:manage-
       Item: { pk, sk: `ROLE#${roleId}`, ...assignment },
     }))
     logger.info('Role assigned', { requestId: c.get('requestId'), orgId, targetUserId, roleId })
-    await writeAuditEvent({
-      orgId,
+    await auditWriter(c)({
       resourceType: 'roleAssignment',
       action: 'roleAssignment:create',
-      actorUserId: c.get('userId'),
-      actorEmail: c.get('email'),
       after: { userId: targetUserId, userEmail: targetUserEmail, roleId, roleName: role.name },
     })
     return ok(c, { roleAssignment: assignment }, 201)
@@ -105,12 +102,9 @@ roleAssignments.post('/:userId/role-assignments', requirePermission('org:manage-
     Item: { pk, sk: `GROUP#${groupId}`, ...assignment },
   }))
   logger.info('Group assigned', { requestId: c.get('requestId'), orgId, targetUserId, groupId })
-  await writeAuditEvent({
-    orgId,
+  await auditWriter(c)({
     resourceType: 'groupAssignment',
     action: 'groupAssignment:create',
-    actorUserId: c.get('userId'),
-    actorEmail: c.get('email'),
     after: { userId: targetUserId, userEmail: targetUserEmail, groupId, groupName: group.name },
   })
   return ok(c, { roleAssignment: assignment }, 201)
@@ -146,12 +140,9 @@ roleAssignments.delete('/:userId/role-assignments/role/:roleId', requirePermissi
   }
 
   logger.info('Role unassigned', { requestId: c.get('requestId'), orgId, targetUserId, roleId })
-  await writeAuditEvent({
-    orgId,
+  await auditWriter(c)({
     resourceType: 'roleAssignment',
     action: 'roleAssignment:delete',
-    actorUserId: c.get('userId'),
-    actorEmail: c.get('email'),
     before: {
       userId: targetUserId,
       userEmail: (targetUserRes.Item?.['email'] as string) ?? 'unknown',
@@ -192,12 +183,9 @@ roleAssignments.delete('/:userId/role-assignments/group/:groupId', requirePermis
   }
 
   logger.info('Group unassigned', { requestId: c.get('requestId'), orgId, targetUserId, groupId })
-  await writeAuditEvent({
-    orgId,
+  await auditWriter(c)({
     resourceType: 'groupAssignment',
     action: 'groupAssignment:delete',
-    actorUserId: c.get('userId'),
-    actorEmail: c.get('email'),
     before: {
       userId: targetUserId,
       userEmail: (targetUserRes.Item?.['email'] as string) ?? 'unknown',
