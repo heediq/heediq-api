@@ -14,16 +14,20 @@
     "bundle:auth-provision": "esbuild src/handlers/auth-provision.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/auth-provision.js --external:@aws-sdk/*",
     "bundle:auth-trigger-pre-signup": "esbuild src/handlers/auth-trigger-pre-signup.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/auth-trigger-pre-signup.js --external:@aws-sdk/*",
     "bundle:auth-trigger-post-confirmation": "esbuild src/handlers/auth-trigger-post-confirmation.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/auth-trigger-post-confirmation.js --external:@aws-sdk/*",
-    "bundle:auth-trigger-post-authentication": "esbuild src/handlers/auth-trigger-post-authentication.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/auth-trigger-post-authentication.js --external:@aws-sdk/*"
+    "bundle:auth-trigger-post-authentication": "esbuild src/handlers/auth-trigger-post-authentication.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/auth-trigger-post-authentication.js --external:@aws-sdk/*",
+    "bundle:ws-connect": "esbuild src/handlers/ws-connect.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/ws-connect.js --external:@aws-sdk/*",
+    "bundle:ws-pusher": "esbuild src/handlers/ws-pusher.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/ws-pusher.js --external:@aws-sdk/*"
   },
   "dependencies": {
+    "@aws-sdk/client-apigatewaymanagementapi": "^3.1086.0",
     "@aws-sdk/client-cognito-identity-provider": "^3.1079.0",
     "@aws-sdk/client-dynamodb": "^3.600.0",
     "@aws-sdk/client-s3": "^3.600.0",
     "@aws-sdk/client-sqs": "^3.600.0",
     "@aws-sdk/lib-dynamodb": "^3.600.0",
     "@aws-sdk/s3-request-presigner": "^3.600.0",
-    "@heediq/shared": "^0.11.0",
+    "@aws-sdk/util-dynamodb": "^3.996.5",
+    "@heediq/shared": "^0.12.0",
     "@hono/node-server": "^2.0.6",
     "hono": "^4.5.0",
     "jose": "^5.6.0",
