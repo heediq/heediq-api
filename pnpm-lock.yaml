@@ -27,8 +27,8 @@ importers:
         specifier: ^3.600.0
         version: 3.1075.0
       '@heediq/shared':
-        specifier: ^0.10.0
-        version: 0.10.0
+        specifier: ^0.11.0
+        version: 0.11.0
       '@hono/node-server':
         specifier: ^2.0.6
         version: 2.0.6(hono@4.12.27)
@@ -564,8 +564,8 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@heediq/shared@0.10.0':
-    resolution: {integrity: sha512-JlvmxS27c3TKauFgiA/9KngU62eAFy83H6I7I9YRXH0gMNLou1fMUuln6+gjfAWObEzNeC9WqVApzUWH1RgiFA==, tarball: https://npm.pkg.github.com/download/@heediq/shared/0.10.0/ca212d99505a2df53bc3c7e2850c14bb4616dcf7}
+  '@heediq/shared@0.11.0':
+    resolution: {integrity: sha512-cnKgm+wowe6x97Aac4tZDh87GFUoC0v/UB4JKm59C13M9ToBfIWI3Lja7lzjfmCckRXk0XeJyt4va7Iu95lFbw==, tarball: https://npm.pkg.github.com/download/@heediq/shared/0.11.0/ce1ef13d09e30e4eae548776ba6af5967608e240}
     engines: {node: '>=22'}
 
   '@hono/node-server@2.0.6':
@@ -1634,7 +1634,7 @@ snapshots:
   '@esbuild/win32-x64@0.28.1':
     optional: true
 
-  '@heediq/shared@0.10.0':
+  '@heediq/shared@0.11.0':
     dependencies:
       zod: 3.25.76
 
