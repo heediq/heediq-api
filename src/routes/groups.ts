@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import { GetCommand, PutCommand, UpdateCommand, DeleteCommand, QueryCommand, BatchGetCommand } from '@aws-sdk/lib-dynamodb'
 import { randomUUID } from 'crypto'
 import { dynamo } from '../lib/dynamo.js'
-import { writeAuditEvent } from '../lib/audit.js'
+import { auditWriter } from '../lib/audit.js'
 import { apiError, ok } from '../lib/errors.js'
 import { config } from '../config.js'
 import type { AuthContext } from '../middleware/auth.js'
@@ -72,12 +72,9 @@ groups.post('/', requirePermission('org:manage-roles'), async (c) => {
     Item: { pk: `ORG#${orgId}`, sk: `GROUP#${groupId}`, ...group },
   }))
   logger.info('Group created', { requestId: c.get('requestId'), orgId, groupId })
-  await writeAuditEvent({
-    orgId,
+  await auditWriter(c)({
     resourceType: 'group',
     action: 'group:create',
-    actorUserId: c.get('userId'),
-    actorEmail: c.get('email'),
     after: { groupId, name: group.name, roleIds: group.roleIds },
   })
   return ok(c, { group }, 201)
@@ -151,12 +148,9 @@ groups.patch('/:id', requirePermission('org:manage-roles'), async (c) => {
 
   const after = GroupSchema.parse(res.Attributes)
   logger.info('Group updated', { requestId: c.get('requestId'), orgId, groupId: id })
-  await writeAuditEvent({
-    orgId,
+  await auditWriter(c)({
     resourceType: 'group',
     action: 'group:update',
-    actorUserId: c.get('userId'),
-    actorEmail: c.get('email'),
     before: { groupId: id, name: before.name, roleIds: before.roleIds },
     after: { groupId: id, name: after.name, roleIds: after.roleIds },
   })
@@ -189,12 +183,9 @@ groups.delete('/:id', requirePermission('org:manage-roles'), async (c) => {
   }
 
   logger.info('Group deleted', { requestId: c.get('requestId'), orgId, groupId: id })
-  await writeAuditEvent({
-    orgId,
+  await auditWriter(c)({
     resourceType: 'group',
     action: 'group:delete',
-    actorUserId: c.get('userId'),
-    actorEmail: c.get('email'),
     before: { groupId: id, name: before.name, roleIds: before.roleIds },
   })
   return ok(c, { deleted: true })

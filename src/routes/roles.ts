@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import { GetCommand, PutCommand, UpdateCommand, DeleteCommand, QueryCommand } from '@aws-sdk/lib-dynamodb'
 import { randomUUID } from 'crypto'
 import { dynamo } from '../lib/dynamo.js'
-import { writeAuditEvent } from '../lib/audit.js'
+import { auditWriter } from '../lib/audit.js'
 import { apiError, ok } from '../lib/errors.js'
 import { config } from '../config.js'
 import type { AuthContext } from '../middleware/auth.js'
@@ -58,12 +58,9 @@ roles.post('/', requirePermission('org:manage-roles'), async (c) => {
     Item: { pk: `ORG#${orgId}`, sk: `ROLE#${roleId}`, ...role },
   }))
   logger.info('Role created', { requestId: c.get('requestId'), orgId, roleId })
-  await writeAuditEvent({
-    orgId,
+  await auditWriter(c)({
     resourceType: 'role',
     action: 'role:create',
-    actorUserId: c.get('userId'),
-    actorEmail: c.get('email'),
     after: { roleId, name: role.name, permissions: role.permissions },
   })
   return ok(c, { role }, 201)
@@ -134,12 +131,9 @@ roles.patch('/:id', requirePermission('org:manage-roles'), async (c) => {
 
   const after = RoleSchema.parse(res.Attributes)
   logger.info('Role updated', { requestId: c.get('requestId'), orgId, roleId: id })
-  await writeAuditEvent({
-    orgId,
+  await auditWriter(c)({
     resourceType: 'role',
     action: 'role:update',
-    actorUserId: c.get('userId'),
-    actorEmail: c.get('email'),
     before: { roleId: id, name: before.name, permissions: before.permissions },
     after: { roleId: id, name: after.name, permissions: after.permissions },
   })
@@ -175,12 +169,9 @@ roles.delete('/:id', requirePermission('org:manage-roles'), async (c) => {
   }
 
   logger.info('Role deleted', { requestId: c.get('requestId'), orgId, roleId: id })
-  await writeAuditEvent({
-    orgId,
+  await auditWriter(c)({
     resourceType: 'role',
     action: 'role:delete',
-    actorUserId: c.get('userId'),
-    actorEmail: c.get('email'),
     before: { roleId: id, name: before.name, permissions: before.permissions },
   })
   return ok(c, { deleted: true })
