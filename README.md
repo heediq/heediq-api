@@ -34,6 +34,9 @@ All Heediq REST endpoints in a single Lambda function. Handles auth, Source CRUD
 - `src/routes/groups.ts` — Group CRUD (D-102): `GET/POST /api/v1/groups`, `GET/PATCH/DELETE /api/v1/groups/:id`; writes gated by `requirePermission('org:manage-roles')` (D-105); validates every `roleIds[]` entry exists in the org (`BatchGetCommand`) before create/update
 - `src/routes/role-assignments.ts` — Direct role/group assignment (D-102): `GET/POST /api/v1/users/:userId/role-assignments`, `DELETE /api/v1/users/:userId/role-assignments/role/:roleId` and `.../group/:groupId`; writes gated by `requirePermission('org:manage-roles')` (D-105); validates the target `roleId`/`groupId` exists in-org before assigning
 - `src/routes/audit-log.ts` — `GET /api/v1/org/audit-log` (D-102 Phase 5): cursor-paginated read path over `heediq-audit-log`, gated by `requirePermission('audit:read')`; filterable by `from`/`to`, `action`, `resourceType`, and `actorUserId` (routes to the `by-user` GSI, re-asserting `orgId` via `FilterExpression` as cross-org defense-in-depth)
+- `src/handlers/ws-connect.ts` — WebSocket `$connect`/`$disconnect`/`$default` handler (D-061, generalized D-109): validates the JWT (passed as `?token=`, not a header) on connect and writes a `heediq-ws-connections` row keyed by `connectionId` with `userId`/`orgId`/`broadcastKey`; deletes the row on disconnect
+- `src/handlers/ws-pusher.ts` — DDB Streams (`MODIFY`) consumer on `heediq-jobs` (D-061, generalized D-109): builds a `job_status` event via `@heediq/shared`'s `buildWsEvent()` and pushes it at org scope via `wsPush.ts`
+- `src/lib/wsPush.ts` — shared real-time push library (D-109): `pushToUser`/`pushToOrg`/`pushBroadcast`, any future feature's entry point for pushing a `WsEventEnvelope` without a DDB-Streams round trip; queries the matching GSI, POSTs via `ApiGatewayManagementApiClient`, self-heals by deleting a connection row on `GoneException`
 
 ## Data Flow
 
@@ -162,23 +165,28 @@ new router follows the same pattern — mount it in `app.ts`, don't hardcode the
 ## Testing
 
 ```bash
-pnpm run test          # 167 unit tests (auth routes + auth methods + auth triggers + sources + app routing + rate limiting + roles + groups + role-assignments + rbac + rbac-middleware + me + users)
+pnpm run test          # 183 unit tests (auth routes + auth methods + auth triggers + sources + app routing + rate limiting + roles + groups + role-assignments + rbac + rbac-middleware + me + users + wsPush + ws-connect + ws-pusher)
 pnpm run typecheck     # tsc --noEmit
 pnpm run test:pre-pr   # typecheck + test (run before opening a PR)
 pnpm run dev           # local dev server on :3000 (tsx watch)
 ```
 
 `pnpm run dev` calls `requireEnv()` in `config.ts` at cold start and crashes immediately if any of
-these 18 vars are unset — all real AWS resources deployed by `heediq-infra`, no local fakes:
+these 19 vars are unset — all real AWS resources deployed by `heediq-infra`, no local fakes:
 `COGNITO_USER_POOL_ID`, `COGNITO_CLIENT_ID`, `SOURCES_TABLE_NAME`, `ORGS_TABLE_NAME`,
 `USERS_TABLE_NAME`, `JOBS_TABLE_NAME`, `WS_CONNECTIONS_TABLE_NAME`, `USER_AUTH_METHODS_TABLE_NAME`,
 `AUTH_AUDIT_LOG_TABLE_NAME`, `RATE_LIMITS_TABLE_NAME`, `COGNITO_IDENTITIES_TABLE_NAME`,
 `AUDIO_BUCKET_NAME`, `TRANSCRIPTION_QUEUE_URL`, `SUMMARIZATION_QUEUE_URL`, `ROLES_TABLE_NAME`,
-`GROUPS_TABLE_NAME`, `ROLE_ASSIGNMENTS_TABLE_NAME`, `AUDIT_LOG_TABLE_NAME`. Pull the actual values
+`GROUPS_TABLE_NAME`, `ROLE_ASSIGNMENTS_TABLE_NAME`, `AUDIT_LOG_TABLE_NAME`,
+`WS_MANAGEMENT_ENDPOINT` (D-109). Pull the actual values
 from the deployed `dev` account (SSM params / CDK stack outputs, see `heediq-infra/README.md`) into
 a local `.env` and export before running `dev`.
 
-Integration tests (Vitest + DynamoDB Local) — to be added once the integration suite is set up.
+Integration tests (Vitest + DynamoDB Local) — no DynamoDB Local/LocalStack scaffolding exists
+anywhere in this repo yet (nor the wider monorepo); `wsPush.ts`/`ws-connect.ts`/`ws-pusher.ts` are
+covered by unit tests only for now (mocking `dynamo.send`, not a real table). This is a known gap
+against the `05-testing.md` contract (new DB access patterns should get an integration test against
+a real table), not a deliberate exception — flagged here rather than silently skipped.
 
 ## Gotchas & Constraints
 
@@ -192,7 +200,7 @@ Integration tests (Vitest + DynamoDB Local) — to be added once the integration
 - **`@heediq/shared` install:** CI uses `NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` to pull from GitHub Packages. Local dev requires a GitHub PAT with `read:packages` scope set as `NODE_AUTH_TOKEN` — add `//npm.pkg.github.com/:_authToken=<PAT>` to `~/.npmrc` or export the var before running `pnpm install`.
 - **JWKS caching:** `createRemoteJWKSet()` is called once at cold start; jose handles key rotation automatically.
 - **Structured logging (D-085/D-093):** `app.ts` and `routes/sources.ts` log via `@heediq/shared`'s `createLogger('heediq-api')` — structured JSON with `requestId` (from `request-id.ts` middleware) and `sourceId` where available. Raw `console.log`/`console.error` is disallowed (D-093) — always go through the logger. Default log level is `info` in every environment; `debug` is opt-in via the `LOG_LEVEL` env var, read at runtime with no redeploy needed. The logger's own PII denylist redacts transcript/email/token-like fields; never pass raw transcript text as log metadata. X-Ray active tracing is enabled on the Lambda (`heediq-infra` `ApiStack`, D-085) for request-level tracing alongside these logs.
-- **`WS_CONNECTIONS_TABLE_NAME` env var:** required by `config.ts` and injected by CDK, but the WebSocket connect/disconnect route handlers are not yet implemented in this Lambda. The table reference is pre-wired here ready for the WS handler code (D-050). Without this var the Lambda will crash at cold start.
+- **Real-time WebSocket framework (D-061, generalized D-109):** `src/handlers/ws-connect.ts` ($connect/$disconnect — validates the JWT passed as a `?token=` query param since browsers can't set custom headers during the WS handshake, then writes/deletes a `heediq-ws-connections` row keyed by `connectionId` with `userId`/`orgId`/`broadcastKey`) and `src/handlers/ws-pusher.ts` (DDB Streams `MODIFY` consumer on `heediq-jobs`, pushes a `job_status` event at org scope) are separate bundled Lambda entry points (own `bundle:ws-connect`/`bundle:ws-pusher` esbuild scripts), same pattern as the `auth-trigger-*` handlers below. `src/lib/wsPush.ts` is the shared fan-out library (`pushToUser`/`pushToOrg`/`pushBroadcast`) any future feature calls directly — it queries the relevant GSI (`by-user`/`by-org`/`by-broadcast`), POSTs via `ApiGatewayManagementApiClient`, and self-heals by deleting a connection row on `GoneException`. `WS_MANAGEMENT_ENDPOINT` is required by `config.ts`'s new `ws` namespace.
 - **D-060:** Model access is enforced by fetching the org's `plan` field from DynamoDB on every enqueue request — not cached. Acceptable at MVP scale; add caching if DynamoDB latency becomes a concern.
 - **Source list pagination:** cursor is a base64url-encoded DynamoDB `LastEvaluatedKey`. Members only see their own sources (FilterExpression); admins see all org sources.
 - **`labels: []` set explicitly on create:** the `Source` object built in `POST /sources` is written directly via `PutCommand`, bypassing `SourceSchema.parse()`, so the schema's `labels` default (`[]`) is set explicitly in code to match what a read-back `.parse()` would produce.

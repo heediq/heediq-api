@@ -37,6 +37,9 @@ export const config = {
     transcriptionQueueUrl: requireEnv('TRANSCRIPTION_QUEUE_URL'),
     summarizationQueueUrl: requireEnv('SUMMARIZATION_QUEUE_URL'),
   },
+  ws: {
+    managementEndpoint: requireEnv('WS_MANAGEMENT_ENDPOINT'),
+  },
   cors: {
     origins: (process.env['CORS_ORIGINS'] ?? '').split(',').filter(Boolean),
   },
