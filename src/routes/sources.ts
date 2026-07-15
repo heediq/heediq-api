@@ -6,6 +6,8 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { randomUUID } from 'crypto'
 import { dynamo } from '../lib/dynamo.js'
 import { apiError, ok } from '../lib/errors.js'
+import { auditWriter } from '../lib/audit.js'
+import { requirePermission } from '../middleware/rbac.js'
 import { config } from '../config.js'
 import type { AuthContext } from '../middleware/auth.js'
 import type { RequestIdContext } from '../middleware/request-id.js'
@@ -32,6 +34,14 @@ const sources = new Hono<SourcesContext>()
 
 function isAwsError(err: unknown): err is { name: string } {
   return typeof err === 'object' && err !== null && 'name' in err
+}
+
+// Audit entries are human-readable and self-contained (D-102), so a source mutation needs the
+// owner's email even though the actor (who may have org-wide sources:update/delete) can differ
+// from the source's userId — resolved via the users table rather than assumed to be the caller.
+async function resolveOwnerEmail(userId: string): Promise<string> {
+  const res = await dynamo.send(new GetCommand({ TableName: config.dynamo.usersTable, Key: { userId } }))
+  return (res.Item?.['email'] as string) ?? 'unknown'
 }
 
 // GET /api/v1/sources — list org sources, cursor-paginated
@@ -70,7 +80,7 @@ sources.get('/', async (c) => {
 })
 
 // POST /api/v1/sources — create source
-sources.post('/', async (c) => {
+sources.post('/', requirePermission('sources:create'), async (c) => {
   const orgId = c.get('orgId')
   const userId = c.get('userId')
   const body = await c.req.json()
@@ -94,6 +104,11 @@ sources.post('/', async (c) => {
 
   await dynamo.send(new PutCommand({ TableName: config.dynamo.sourcesTable, Item: source }))
   logger.info('Source created', { requestId: c.get('requestId'), sourceId: source.sourceId, orgId })
+  await auditWriter(c)({
+    resourceType: 'source',
+    action: 'source:create',
+    after: { sourceId: source.sourceId, title: source.title, ownerEmail: c.get('email') },
+  })
   return ok(c, { source }, 201)
 })
 
@@ -112,7 +127,7 @@ sources.get('/:id', async (c) => {
 })
 
 // PATCH /api/v1/sources/:id
-sources.patch('/:id', async (c) => {
+sources.patch('/:id', requirePermission('sources:update'), async (c) => {
   const orgId = c.get('orgId')
   const id = c.req.param('id')
   const body = await c.req.json()
@@ -120,6 +135,15 @@ sources.patch('/:id', async (c) => {
   if (!parsed.success) {
     return apiError(c, 'BAD_REQUEST', 'Invalid request body', parsed.error.flatten())
   }
+
+  const existingRes = await dynamo.send(new GetCommand({
+    TableName: config.dynamo.sourcesTable,
+    Key: { orgId, sourceId: id },
+  }))
+  if (!existingRes.Item) {
+    return apiError(c, 'NOT_FOUND', 'Source not found')
+  }
+  const before = SourceSchema.parse(existingRes.Item)
 
   const now = new Date().toISOString()
   let res
@@ -141,13 +165,31 @@ sources.patch('/:id', async (c) => {
   }
 
   logger.info('Source updated', { requestId: c.get('requestId'), sourceId: id, orgId })
-  return ok(c, { source: SourceSchema.parse(res.Attributes) })
+  const after = SourceSchema.parse(res.Attributes)
+  const ownerEmail = await resolveOwnerEmail(after.userId)
+  await auditWriter(c)({
+    resourceType: 'source',
+    action: 'source:update',
+    before: { sourceId: before.sourceId, title: before.title, ownerEmail },
+    after: { sourceId: after.sourceId, title: after.title, ownerEmail },
+  })
+  return ok(c, { source: after })
 })
 
 // DELETE /api/v1/sources/:id — soft-delete (marks deletedAt, sets status=failed)
-sources.delete('/:id', async (c) => {
+sources.delete('/:id', requirePermission('sources:delete'), async (c) => {
   const orgId = c.get('orgId')
   const id = c.req.param('id')
+
+  const existingRes = await dynamo.send(new GetCommand({
+    TableName: config.dynamo.sourcesTable,
+    Key: { orgId, sourceId: id },
+  }))
+  if (!existingRes.Item) {
+    return apiError(c, 'NOT_FOUND', 'Source not found')
+  }
+  const before = SourceSchema.parse(existingRes.Item)
+
   const now = new Date().toISOString()
   try {
     await dynamo.send(new UpdateCommand({
@@ -165,6 +207,12 @@ sources.delete('/:id', async (c) => {
     throw err
   }
   logger.info('Source soft-deleted', { requestId: c.get('requestId'), sourceId: id, orgId })
+  const ownerEmail = await resolveOwnerEmail(before.userId)
+  await auditWriter(c)({
+    resourceType: 'source',
+    action: 'source:delete',
+    before: { sourceId: before.sourceId, title: before.title, ownerEmail },
+  })
   return ok(c, { deleted: true })
 })
 

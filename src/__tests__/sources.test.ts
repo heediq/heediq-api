@@ -122,7 +122,8 @@ describe('POST /sources', () => {
   beforeEach(() => vi.clearAllMocks())
 
   it('creates a source', async () => {
-    mockDynamoSend.mockResolvedValueOnce({})
+    mockDynamoSend.mockResolvedValueOnce({}) // PutCommand — create source
+    mockDynamoSend.mockResolvedValueOnce({}) // PutCommand — audit event (D-107)
     const res = await makeApp().request('/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -133,6 +134,27 @@ describe('POST /sources', () => {
     expect(body.data.source.title).toBe('Sprint planning')
   })
 
+  it('writes a source:create audit event with the actor as owner (D-107)', async () => {
+    mockDynamoSend.mockResolvedValueOnce({})
+    mockDynamoSend.mockResolvedValueOnce({})
+    await makeApp().request('/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Sprint planning' }),
+    })
+    expect(mockDynamoSend).toHaveBeenNthCalledWith(2,
+      expect.objectContaining({
+        input: expect.objectContaining({
+          Item: expect.objectContaining({
+            resourceType: 'source',
+            action: 'source:create',
+            after: expect.objectContaining({ title: 'Sprint planning', ownerEmail: 'a@b.com' }),
+          }),
+        }),
+      }),
+    )
+  })
+
   it('rejects empty title', async () => {
     const res = await makeApp().request('/', {
       method: 'POST',
@@ -140,6 +162,15 @@ describe('POST /sources', () => {
       body: JSON.stringify({ title: '' }),
     })
     expect(res.status).toBe(400)
+  })
+
+  it('returns 403 without sources:create permission (D-107)', async () => {
+    const res = await makeApp('member', []).request('/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Sprint planning' }),
+    })
+    expect(res.status).toBe(403)
   })
 })
 
@@ -311,13 +342,21 @@ describe('POST /:id/jobs — D-060 access control', () => {
   })
 })
 
+const existingSource = {
+  sourceId: uuid, orgId: orgId, userId: userId, title: 'Old', status: 'ready' as const,
+  labels: [], createdAt: now, updatedAt: now,
+}
+
 describe('PATCH /:id — org isolation', () => {
   beforeEach(() => vi.clearAllMocks())
 
   it('keys the Update by orgId + sourceId and updates the title', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Item: existingSource }) // GetCommand — before-state
     mockDynamoSend.mockResolvedValueOnce({
       Attributes: { sourceId: uuid, orgId: orgId, userId: userId, title: 'New', status: 'ready', labels: [], createdAt: now, updatedAt: now },
-    })
+    }) // UpdateCommand
+    mockDynamoSend.mockResolvedValueOnce({ Item: { email: 'owner@heediq.com' } }) // GetCommand — resolveOwnerEmail
+    mockDynamoSend.mockResolvedValueOnce({}) // PutCommand — audit event (D-107)
     const res = await makeApp().request(`/${uuid}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -329,7 +368,44 @@ describe('PATCH /:id — org isolation', () => {
     )
   })
 
-  it('returns 404 when the conditional check fails (wrong org or missing source)', async () => {
+  it('writes a source:update audit event with before/after titles (D-107)', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Item: existingSource })
+    mockDynamoSend.mockResolvedValueOnce({
+      Attributes: { sourceId: uuid, orgId: orgId, userId: userId, title: 'New', status: 'ready', labels: [], createdAt: now, updatedAt: now },
+    })
+    mockDynamoSend.mockResolvedValueOnce({ Item: { email: 'owner@heediq.com' } })
+    mockDynamoSend.mockResolvedValueOnce({})
+    await makeApp().request(`/${uuid}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'New' }),
+    })
+    expect(mockDynamoSend).toHaveBeenNthCalledWith(4,
+      expect.objectContaining({
+        input: expect.objectContaining({
+          Item: expect.objectContaining({
+            resourceType: 'source',
+            action: 'source:update',
+            before: expect.objectContaining({ title: 'Old', ownerEmail: 'owner@heediq.com' }),
+            after: expect.objectContaining({ title: 'New', ownerEmail: 'owner@heediq.com' }),
+          }),
+        }),
+      }),
+    )
+  })
+
+  it('returns 404 when the source does not exist (wrong org or missing source)', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Item: undefined })
+    const res = await makeApp().request(`/${uuid}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'New' }),
+    })
+    expect(res.status).toBe(404)
+  })
+
+  it('returns 404 when the conditional check fails on update (race after existence check)', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Item: existingSource })
     mockDynamoSend.mockRejectedValueOnce(Object.assign(new Error('conflict'), { name: 'ConditionalCheckFailedException' }))
     const res = await makeApp().request(`/${uuid}`, {
       method: 'PATCH',
@@ -337,6 +413,15 @@ describe('PATCH /:id — org isolation', () => {
       body: JSON.stringify({ title: 'New' }),
     })
     expect(res.status).toBe(404)
+  })
+
+  it('returns 403 without sources:update permission (D-107)', async () => {
+    const res = await makeApp('member', []).request(`/${uuid}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'New' }),
+    })
+    expect(res.status).toBe(403)
   })
 })
 
@@ -344,7 +429,10 @@ describe('DELETE /:id — org isolation', () => {
   beforeEach(() => vi.clearAllMocks())
 
   it('keys the Update by orgId + sourceId', async () => {
-    mockDynamoSend.mockResolvedValueOnce({})
+    mockDynamoSend.mockResolvedValueOnce({ Item: existingSource }) // GetCommand — before-state
+    mockDynamoSend.mockResolvedValueOnce({}) // UpdateCommand — soft-delete
+    mockDynamoSend.mockResolvedValueOnce({ Item: { email: 'owner@heediq.com' } }) // GetCommand — resolveOwnerEmail
+    mockDynamoSend.mockResolvedValueOnce({}) // PutCommand — audit event (D-107)
     const res = await makeApp().request(`/${uuid}`, { method: 'DELETE' })
     expect(res.status).toBe(200)
     expect(mockDynamoSend).toHaveBeenCalledWith(
@@ -352,9 +440,41 @@ describe('DELETE /:id — org isolation', () => {
     )
   })
 
-  it('returns 404 when the conditional check fails (wrong org or missing source)', async () => {
+  it('writes a source:delete audit event with before-only payload (D-107)', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Item: existingSource })
+    mockDynamoSend.mockResolvedValueOnce({})
+    mockDynamoSend.mockResolvedValueOnce({ Item: { email: 'owner@heediq.com' } })
+    mockDynamoSend.mockResolvedValueOnce({})
+    await makeApp().request(`/${uuid}`, { method: 'DELETE' })
+    expect(mockDynamoSend).toHaveBeenNthCalledWith(4,
+      expect.objectContaining({
+        input: expect.objectContaining({
+          Item: expect.objectContaining({
+            resourceType: 'source',
+            action: 'source:delete',
+            before: expect.objectContaining({ title: 'Old', ownerEmail: 'owner@heediq.com' }),
+            after: undefined,
+          }),
+        }),
+      }),
+    )
+  })
+
+  it('returns 404 when the source does not exist (wrong org or missing source)', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Item: undefined })
+    const res = await makeApp().request(`/${uuid}`, { method: 'DELETE' })
+    expect(res.status).toBe(404)
+  })
+
+  it('returns 404 when the conditional check fails on delete (race after existence check)', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Item: existingSource })
     mockDynamoSend.mockRejectedValueOnce(Object.assign(new Error('conflict'), { name: 'ConditionalCheckFailedException' }))
     const res = await makeApp().request(`/${uuid}`, { method: 'DELETE' })
     expect(res.status).toBe(404)
+  })
+
+  it('returns 403 without sources:delete permission (D-107)', async () => {
+    const res = await makeApp('member', []).request(`/${uuid}`, { method: 'DELETE' })
+    expect(res.status).toBe(403)
   })
 })
