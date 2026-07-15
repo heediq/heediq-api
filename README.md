@@ -205,6 +205,11 @@ synthetic-auth-middleware pattern as the mocked unit tests (mount the router dir
 `userId`/`orgId`/`role`/`permissions` on context), just against the real `dynamo` client.
 `wsPush.ts`/`ws-connect.ts`/`ws-pusher.ts` remain unit-test-only for now.
 
+CI runs the integration suite as a gate on every PR targeting `main` (i.e. the `develop`→`main`
+staging-promotion PR) — see `integration-test` job in `.github/workflows/ci.yml`. It does not run on
+PRs targeting `develop`, to keep that gate fast; unit tests + typecheck still run on every PR either
+way.
+
 ## Gotchas & Constraints
 
 - **Route-prefix tests must use the real `app` (D-088):** `src/__tests__/app-routing.test.ts`
