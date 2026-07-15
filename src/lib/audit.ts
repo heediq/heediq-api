@@ -14,6 +14,7 @@ export interface WriteAuditEventInput<T extends AuditResourceType> {
   actorUserId: string
   actorEmail: string
   actorRole: OrgRole
+  effect?: 'permitted' | 'denied'
   before?: AuditPayloadMap[T]
   after?: AuditPayloadMap[T]
 }

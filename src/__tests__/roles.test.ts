@@ -87,7 +87,9 @@ describe('POST /roles', () => {
       body: JSON.stringify({ name: 'Reviewer', permissions: [] }),
     })
     expect(res.status).toBe(403)
-    expect(mockDynamoSend).not.toHaveBeenCalled()
+    // No route-level DB access happens (the handler never runs) — the one call is
+    // requirePermission's own denial audit write (D-114), not a route-triggered read/write.
+    expect(mockDynamoSend).toHaveBeenCalledTimes(1)
   })
 
   it('rejects an invalid body', async () => {
