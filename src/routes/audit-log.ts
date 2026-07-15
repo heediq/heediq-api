@@ -34,8 +34,12 @@ auditLogRouter.get('/', requirePermission('audit:read'), async (c) => {
 
   const filterClauses: string[] = []
   const values: Record<string, string> = {}
+  // `action` is a DynamoDB reserved keyword — must go through ExpressionAttributeNames or every
+  // query with an action filter fails at the real DB (a mocked dynamo.send() never catches this).
+  const names: Record<string, string> = {}
   if (action) {
-    filterClauses.push('action = :action')
+    filterClauses.push('#action = :action')
+    names['#action'] = 'action'
     values[':action'] = action
   }
   if (resourceType) {
@@ -75,6 +79,7 @@ auditLogRouter.get('/', requirePermission('audit:read'), async (c) => {
     IndexName: indexName,
     KeyConditionExpression: keyCondition,
     FilterExpression: filterClauses.length > 0 ? filterClauses.join(' AND ') : undefined,
+    ExpressionAttributeNames: Object.keys(names).length > 0 ? names : undefined,
     ExpressionAttributeValues: values,
     Limit: limit + 1,
     ExclusiveStartKey: cursor ? JSON.parse(Buffer.from(cursor, 'base64url').toString()) : undefined,

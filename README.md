@@ -17,6 +17,10 @@ All Heediq REST endpoints in a single Lambda function. Handles auth, Source CRUD
 - `src/middleware/request-id.ts` — correlation ID middleware (D-085): reads `X-Request-Id` from the caller or generates a UUID, sets it on context, and echoes it back as a response header
 - `src/lib/errors.ts` — `apiError()` / `ok()` response helpers with consistent envelope (D-033)
 - `src/lib/dynamo.ts` — DynamoDB Document Client singleton
+- `docker-compose.integration.yml` — starts `amazon/dynamodb-local` (in-memory, shared DB) for integration tests
+- `scripts/integration/create-tables.ts` — bootstraps all tables + GSIs against DynamoDB Local, mirroring `heediq-infra/lib/foundation/tables.ts`; skips tables that already exist
+- `tests/integration/seed.ts` — shared integration seed helpers (`seedOrg`, `seedUser`, `seedIdentity`, `seedRoles`, `seedCustomRole`, `seedGroup`, `seedRoleAssignment`, `seedFullOrg`)
+- `tests/integration/setup-env.ts` — Vitest `setupFiles` entry: sets `DYNAMODB_ENDPOINT` + placeholder values for the other `config.ts` env vars
 - `src/routes/me.ts` — `GET /api/v1/me`; response includes `effectivePermissions` (D-102/D-105), the server-resolved permission set already parsed by `authMiddleware` from the `custom:permissions` JWT claim — the only source of authority `heediq-web`'s `usePermissions`/`<Can>` are allowed to read
 - `src/routes/users.ts` — `GET /api/v1/users` — org-scoped user list (D-102 Phase 4), used by the role/group assignment screen; read-open to any authenticated org member, same posture as `GET /roles`/`GET /groups`
 - `src/routes/sources.ts` — Source CRUD + job enqueue + summary fetch (D-068)
@@ -182,11 +186,29 @@ these 19 vars are unset — all real AWS resources deployed by `heediq-infra`, n
 from the deployed `dev` account (SSM params / CDK stack outputs, see `heediq-infra/README.md`) into
 a local `.env` and export before running `dev`.
 
-Integration tests (Vitest + DynamoDB Local) — no DynamoDB Local/LocalStack scaffolding exists
-anywhere in this repo yet (nor the wider monorepo); `wsPush.ts`/`ws-connect.ts`/`ws-pusher.ts` are
-covered by unit tests only for now (mocking `dynamo.send`, not a real table). This is a known gap
-against the `05-testing.md` contract (new DB access patterns should get an integration test against
-a real table), not a deliberate exception — flagged here rather than silently skipped.
+Integration tests (Vitest + DynamoDB Local, D-030) — `tests/integration/**/*.test.ts`, run against a
+real local table (not a mock), catching wrong-key-shape/reserved-keyword/query-syntax bugs a mocked
+`dynamo.send()` can't:
+
+```bash
+pnpm run docker:integration:up    # starts DynamoDB Local on :8000
+pnpm run test:integration         # bootstraps tables, then runs the integration suite
+pnpm run docker:integration:down  # tears the container down
+```
+
+Covers `auth-provision.ts` (Cognito PreTokenGeneration trigger — first-login org provisioning,
+federated first-login, identities-table resolution, email self-heal), `lib/rbac.ts`'s
+`resolveEffectivePermissions` (direct role, group-mediated, union/dedup, no assignments), and
+`routes/audit-log.ts`'s `GET /org/audit-log` (permission gate, org-scoped listing, action/
+resourceType filter + cross-org isolation, cursor round-trip). Route-level tests use the same
+synthetic-auth-middleware pattern as the mocked unit tests (mount the router directly, set
+`userId`/`orgId`/`role`/`permissions` on context), just against the real `dynamo` client.
+`wsPush.ts`/`ws-connect.ts`/`ws-pusher.ts` remain unit-test-only for now.
+
+CI runs the integration suite as a gate on every PR targeting `main` (i.e. the `develop`→`main`
+staging-promotion PR) — see `integration-test` job in `.github/workflows/ci.yml`. It does not run on
+PRs targeting `develop`, to keep that gate fast; unit tests + typecheck still run on every PR either
+way.
 
 ## Gotchas & Constraints
 
@@ -207,5 +229,7 @@ a real table), not a deliberate exception — flagged here rather than silently 
 - **Deploy:** CI builds via `pnpm run bundle` (esbuild) and runs `aws lambda update-function-code` per environment, gated by the D-070/D-071 org-level `vars.AWS_REGION` / `vars.DEPLOY_ROLE_ARN`. See `heediq-infra/README.md` §"Initial Setup" for CDK-bootstrap prerequisites (Lambda + API Gateway must be deployed by CDK before this repo's CI can update function code).
 - **The 3 `auth-trigger-*.ts` handlers are separate bundled Lambda entry points**, not part of the main API Lambda — each has its own `bundle:auth-trigger-*` esbuild script and its own deploy step in `deploy.yml` per environment, same pattern as `auth-provision.ts`.
 - **`custom:accountId` (D-099) required a full Cognito User Pool replacement:** adding a custom attribute changes the User Pool's `Schema`, which CloudFormation can only apply via full resource replacement — this destroys all existing users in whichever environment it's deployed to. Confirmed and accepted for dev; requires explicit sign-off before staging/prod (existing users would need to re-sign-up).
-- **D-102 Phase 5 audit-log read path (`routes/audit-log.ts`):** `GET /org/audit-log` queries the base table (`pk = ORG#<orgId>`) by default, or the `by-user` GSI when `actorUserId` is given — the GSI query always adds `orgId = :orgId` to the `FilterExpression` too, as explicit cross-org defense-in-depth even though a user belongs to exactly one org today. The Lambda's IAM grant on this table is `Query` + write only — `GetItem`/`Scan` remain blocked (`heediq-infra` `api-stack.ts`), preserving the "no full-table read" posture from Phase 2.
+- **D-102 Phase 5 audit-log read path (`routes/audit-log.ts`):** `GET /org/audit-log` queries the base table (`pk = ORG#<orgId>`) by default, or the `by-user` GSI when `actorUserId` is given — the GSI query always adds `orgId = :orgId` to the `FilterExpression` too, as explicit cross-org defense-in-depth even though a user belongs to exactly one org today. The Lambda's IAM grant on this table is `Query` + write only — `GetItem`/`Scan` remain blocked (`heediq-infra` `api-stack.ts`), preserving the "no full-table read" posture from Phase 2. `action` is a DynamoDB reserved keyword — its `FilterExpression` clause must go through `ExpressionAttributeNames` (`#action`); a mocked `dynamo.send()` unit test can't catch a missed case like this, which is what the integration test layer below is for.
+- **`create-tables.ts` mirrors `heediq-infra/lib/foundation/tables.ts` by hand:** table/GSI definitions are duplicated, not imported, since `heediq-infra` isn't a runtime dependency of this repo. This can silently drift — if a table/GSI changes in `heediq-infra`, `create-tables.ts` must be updated too, or integration tests will pass locally against a schema real AWS no longer has. Flagged as a cross-repo drift-risk check item in `claude-workspace/rules/10-consistency-check.md`.
+- **`dynamo.ts` respects `DYNAMODB_ENDPOINT`:** only ever set by `tests/integration/setup-env.ts` — unset in every deployed Lambda env, so production always targets real AWS DynamoDB.
 - **D-105 permission staleness is bounded by token lifetime, not instant:** since `custom:permissions` is baked into the JWT at issuance rather than checked per-request against DynamoDB, a permission change (role edit, reassignment) only takes effect for a given user on their next token refresh — not immediately. This is a deliberate tradeoff (see `DECISIONS.md` D-105) in exchange for zero added DynamoDB reads on the request hot path.

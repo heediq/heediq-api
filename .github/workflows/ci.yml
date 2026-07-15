@@ -32,3 +32,36 @@ jobs:
 
       - name: Test
         run: pnpm run test
+
+  integration-test:
+    name: Integration tests (DynamoDB Local)
+    runs-on: ubuntu-latest
+    if: github.base_ref == 'main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@heediq'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start DynamoDB Local
+        run: pnpm run docker:integration:up
+
+      - name: Integration test
+        run: pnpm run test:integration
+
+      - name: Stop DynamoDB Local
+        if: always()
+        run: pnpm run docker:integration:down
