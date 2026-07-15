@@ -198,12 +198,19 @@ pnpm run docker:integration:down  # tears the container down
 
 Covers `auth-provision.ts` (Cognito PreTokenGeneration trigger — first-login org provisioning,
 federated first-login, identities-table resolution, email self-heal), `lib/rbac.ts`'s
-`resolveEffectivePermissions` (direct role, group-mediated, union/dedup, no assignments), and
+`resolveEffectivePermissions` (direct role, group-mediated, union/dedup, no assignments),
 `routes/audit-log.ts`'s `GET /org/audit-log` (permission gate, org-scoped listing, action/
-resourceType filter + cross-org isolation, cursor round-trip). Route-level tests use the same
-synthetic-auth-middleware pattern as the mocked unit tests (mount the router directly, set
+resourceType filter + cross-org isolation, cursor round-trip), and the RBAC/sources route CRUD
+surfaces: `routes/roles.ts`, `routes/groups.ts` (including cross-org roleId rejection and roleId
+dedup), `routes/role-assignments.ts`, and `routes/sources.ts` (list/pagination/`ownSourcesOnly`
+scoping, update/delete existence checks, D-060 tier gating on job enqueue with
+`@aws-sdk/client-sqs` mocked since SQS is outside DynamoDB Local's scope). Route-level tests use
+the same synthetic-auth-middleware pattern as the mocked unit tests (mount the router directly, set
 `userId`/`orgId`/`role`/`permissions` on context), just against the real `dynamo` client.
-`wsPush.ts`/`ws-connect.ts`/`ws-pusher.ts` remain unit-test-only for now.
+`tests/integration/scenarios/rbac-journey.test.ts` chains role → group → assignment →
+`resolveEffectivePermissions` → audit-log across four routers on one app instance, to catch
+composition breaks a single-route test can't. `wsPush.ts`/`ws-connect.ts`/`ws-pusher.ts` remain
+unit-test-only for now.
 
 CI runs the integration suite as a gate on every PR targeting `main` (i.e. the `develop`→`main`
 staging-promotion PR) — see `integration-test` job in `.github/workflows/ci.yml`. It does not run on
