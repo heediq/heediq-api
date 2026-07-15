@@ -121,7 +121,8 @@ describe('GET /org/audit-log', () => {
     expect(mockDynamoSend).toHaveBeenCalledWith(
       expect.objectContaining({
         input: expect.objectContaining({
-          FilterExpression: 'action = :action AND resourceType = :resourceType',
+          FilterExpression: '#action = :action AND resourceType = :resourceType',
+          ExpressionAttributeNames: { '#action': 'action' },
           ExpressionAttributeValues: expect.objectContaining({ ':action': 'create', ':resourceType': 'role' }),
         }),
       }),
