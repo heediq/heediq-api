@@ -3,6 +3,8 @@ name: Deploy
 on:
   push:
     branches: [develop, main]
+    paths-ignore:
+      - '**/*.md'
 
 # AWS_REGION and deploy role ARNs are resolved from GitHub organization-level
 # Actions variables (D-070, D-071) — not hardcoded per repo.
