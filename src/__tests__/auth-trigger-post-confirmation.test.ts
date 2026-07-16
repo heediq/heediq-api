@@ -31,23 +31,15 @@ describe('auth-trigger-post-confirmation handler', () => {
     expect(send).not.toHaveBeenCalled()
   })
 
-  it('resolves via the identities table and records a native COGNITO method + audit event', async () => {
-    send
-      .mockResolvedValueOnce({ Item: { sub: 'native-sub', accountId: 'account-1' } }) // Get identities table
-      .mockResolvedValueOnce({}) // Put method
-      .mockResolvedValueOnce({}) // Put audit
-
+  it('writes nothing for a native ConfirmSignUp, even when an account already resolves (regression: password not set yet)', async () => {
+    // No `identities` claim -> native confirmation. Must not write METHOD#COGNITO here even
+    // though an existing account (from a prior Google signup) resolves cleanly — the password
+    // isn't set until /link/confirm's AdminSetUserPassword runs. Recording the method this
+    // early previously left GET /auth/methods reporting COGNITO as linked with no credential
+    // behind it whenever the OTP-then-password flow was abandoned between screens.
     await handler(baseEvent(), {} as never, () => undefined)
 
-    expect(send).toHaveBeenCalledTimes(3)
-    const methodPut = send.mock.calls[1]?.[0] as { input: { Item: Record<string, unknown> } }
-    expect(methodPut.input.Item['pk']).toBe('USER#account-1')
-    expect(methodPut.input.Item['sk']).toBe('METHOD#COGNITO')
-    expect(methodPut.input.Item['provider']).toBe('COGNITO')
-
-    const auditPut = send.mock.calls[2]?.[0] as { input: { Item: Record<string, unknown> } }
-    expect(auditPut.input.Item['pk']).toBe('USER#account-1')
-    expect(auditPut.input.Item['action']).toBe('POST_CONFIRMATION_SIGNUP')
+    expect(send).not.toHaveBeenCalled()
   })
 
   it('falls back to the email lookup when the identities table has no mapping', async () => {
@@ -66,12 +58,12 @@ describe('auth-trigger-post-confirmation handler', () => {
     expect(methodPut.input.Item['providerSub']).toBe('g-1')
   })
 
-  it('writes nothing for a genuinely new signup that resolves to no existing account', async () => {
+  it('writes nothing for a federated confirmation that resolves to no existing account', async () => {
     send
       .mockResolvedValueOnce({ Item: undefined }) // Get identities table: no mapping
       .mockResolvedValueOnce({ Items: [] }) // Query by-email: no match
 
-    const result = await handler(baseEvent(), {} as never, () => undefined)
+    const result = await handler(baseEvent({ identities: '[{"providerName":"Google","userId":"g-1"}]' }), {} as never, () => undefined)
 
     expect(send).toHaveBeenCalledTimes(2) // only the two resolution lookups — no writes
     expect(result).toBeDefined()
@@ -84,6 +76,6 @@ describe('auth-trigger-post-confirmation handler', () => {
       .mockRejectedValueOnce(conflict)
       .mockResolvedValueOnce({})
 
-    await expect(handler(baseEvent(), {} as never, () => undefined)).resolves.toBeDefined()
+    await expect(handler(baseEvent({ identities: '[{"providerName":"Google","userId":"g-1"}]' }), {} as never, () => undefined)).resolves.toBeDefined()
   })
 })
