@@ -58,10 +58,18 @@ async function upsertAuthMethod(accountId: string, providerName: string, provide
 // PreTokenGeneration trigger (auth-provision.ts) has run, so for a genuinely new signup no
 // accountId exists yet to write under (D-099: accountId is a fresh app-owned id, not this
 // event's `sub`, so guessing `sub` here would silently orphan the record under a key
-// auth-provision.ts will never use). Only write when an existing account can be positively
-// resolved (an already-linked identity, or an email match for a pre-existing account); a
-// genuinely new account's initial auth method + audit entry are instead recorded by
-// auth-provision.ts at first login, once the real accountId is known.
+// auth-provision.ts will never use). A genuinely new account's initial auth method + audit
+// entry are instead recorded by auth-provision.ts at first login, once the real accountId is
+// known.
+//
+// Only the federated-identity branch writes here. A native (no `identities` claim)
+// ConfirmSignUp only proves the caller owns the email — it does not mean a password exists yet
+// (`/link/request-otp` seeds the shadow user with a random password; the real one is set later
+// by `/link/confirm`'s AdminSetUserPassword). Writing METHOD#COGNITO at this point previously
+// caused a stuck-looking "linked but no password" state whenever the two-step OTP-then-password
+// flow (D-089) was abandoned between screens — GET /auth/methods reported COGNITO as linked
+// with no credential behind it. That row's only correct writer is auth.ts's
+// recordAuthMethodAndAudit, called from `/link/confirm` after the password is actually set.
 export const handler: PostConfirmationTriggerHandler = async (event) => {
   if (event.triggerSource !== 'PostConfirmation_ConfirmSignUp') return event
 
@@ -70,6 +78,12 @@ export const handler: PostConfirmationTriggerHandler = async (event) => {
   const identitiesAttr = event.request.userAttributes['identities']
   const username = event.userName
   const now = new Date().toISOString()
+
+  const providerContext = providerFromIdentitiesAttr(identitiesAttr)
+  if (!providerContext) {
+    logger.info('Native ConfirmSignUp — auth method recorded later, once a password is set', { sub })
+    return event
+  }
 
   const canonicalAccountId =
     (await resolveAccountIdBySub(IDENTITIES_TABLE, sub)) ??
@@ -80,13 +94,7 @@ export const handler: PostConfirmationTriggerHandler = async (event) => {
     return event
   }
 
-  const providerContext = providerFromIdentitiesAttr(identitiesAttr)
-  if (providerContext) {
-    await upsertAuthMethod(canonicalAccountId, providerContext.providerName, providerContext.providerSub, username)
-  } else {
-    // No `identities` claim means this is a native (email/password) confirmation.
-    await upsertAuthMethod(canonicalAccountId, 'COGNITO', canonicalAccountId, username)
-  }
+  await upsertAuthMethod(canonicalAccountId, providerContext.providerName, providerContext.providerSub, username)
 
   await dynamo.send(new PutCommand({
     TableName: AUTH_AUDIT_LOG_TABLE,
@@ -94,7 +102,7 @@ export const handler: PostConfirmationTriggerHandler = async (event) => {
       pk: `USER#${canonicalAccountId}`,
       sk: `EVENT#${now}`,
       action: 'POST_CONFIRMATION_SIGNUP',
-      provider: providerContext?.providerName ?? 'COGNITO',
+      provider: providerContext.providerName,
       createdAt: now,
       details: 'Signup confirmed',
     },
@@ -102,7 +110,7 @@ export const handler: PostConfirmationTriggerHandler = async (event) => {
 
   logger.info('Signup confirmed — auth method recorded', {
     accountId: canonicalAccountId,
-    provider: providerContext?.providerName ?? 'COGNITO',
+    provider: providerContext.providerName,
   })
   return event
 }
