@@ -4,3 +4,5 @@ minimumReleaseAge: 0
 minimumReleaseAgeExclude:
   - '@heediq/shared@0.1.0'
   - '@heediq/shared@0.3.0'
+overrides:
+  '@heediq/shared': link:../heediq-shared

@@ -336,7 +336,7 @@ sources.post('/:id/review', requirePermission('sources:update'), async (c) => {
     TableName: config.dynamo.contextsTable,
     Key: { contextId: parsed.data.contextId },
   }))
-  if (!contextRes.Item || !(await canAccessContext(c, ContextSchema.parse(contextRes.Item)))) {
+  if (!contextRes.Item || !(await canAccessContext(c, ContextSchema.parse(contextRes.Item), 'contribute'))) {
     return apiError(c, 'BAD_REQUEST', 'Context not found or not visible to you')
   }
 

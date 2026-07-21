@@ -6,6 +6,7 @@ import { requestIdMiddleware, type RequestIdContext } from './middleware/request
 import { meRouter } from './routes/me.js'
 import { sourcesRouter } from './routes/sources.js'
 import { contextsRouter } from './routes/contexts.js'
+import { contextGrantsRouter } from './routes/context-grants.js'
 import { uploadRouter } from './routes/upload.js'
 import { authRouter } from './routes/auth.js'
 import { authMethodsRouter } from './routes/auth-methods.js'
@@ -45,6 +46,7 @@ v1.use('*', authMiddleware)
 v1.route('/me', meRouter)
 v1.route('/sources', sourcesRouter)
 v1.route('/contexts', contextsRouter)
+v1.route('/context-grants', contextGrantsRouter)
 v1.route('/upload', uploadRouter)
 v1.route('/auth/methods', authMethodsRouter)
 v1.route('/roles', rolesRouter)

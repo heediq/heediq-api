@@ -28,12 +28,13 @@ export const config = {
     groupsTable: requireEnv('GROUPS_TABLE_NAME'),
     roleAssignmentsTable: requireEnv('ROLE_ASSIGNMENTS_TABLE_NAME'),
     auditLogTable: requireEnv('AUDIT_LOG_TABLE_NAME'),
-    // Context Library (D-124–D-143) — only the two tables step 4b's routes touch. The other 4
-    // (decision-ledger/conversations/chat-messages/context-grants) are granted to this Lambda
-    // already (heediq-infra#61) but stay unconsumed until step 4c adds their routes — added here
-    // only once a route actually reads/writes them, per D-103 scoping.
+    // Context Library (D-124–D-143) — step 4b's two tables plus context-grants (step 4c-i). The
+    // remaining 3 (decision-ledger/conversations/chat-messages) are granted to this Lambda already
+    // (heediq-infra#61) but stay unconsumed until step 4c's later sub-steps add their routes —
+    // added here only once a route actually reads/writes them, per D-103 scoping.
     contextsTable: requireEnv('CONTEXTS_TABLE_NAME'),
     extractedItemsTable: requireEnv('EXTRACTED_ITEMS_TABLE_NAME'),
+    contextGrantsTable: requireEnv('CONTEXT_GRANTS_TABLE_NAME'),
   },
   s3: {
     audioBucket: requireEnv('AUDIO_BUCKET_NAME'),
