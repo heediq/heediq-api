@@ -23,7 +23,8 @@ All Heediq REST endpoints in a single Lambda function. Handles auth, Source CRUD
 - `tests/integration/setup-env.ts` — Vitest `setupFiles` entry: sets `DYNAMODB_ENDPOINT` + placeholder values for the other `config.ts` env vars
 - `src/routes/me.ts` — `GET /api/v1/me`; response includes `effectivePermissions` (D-102/D-105), the server-resolved permission set already parsed by `authMiddleware` from the `custom:permissions` JWT claim — the only source of authority `heediq-web`'s `usePermissions`/`<Can>` are allowed to read
 - `src/routes/users.ts` — `GET /api/v1/users` — org-scoped user list (D-102 Phase 4), used by the role/group assignment screen; read-open to any authenticated org member, same posture as `GET /roles`/`GET /groups`
-- `src/routes/sources.ts` — Source CRUD + job enqueue + summary fetch (D-068)
+- `src/routes/sources.ts` — Source CRUD + job enqueue + summary fetch (D-068) + `POST /:id/review` (D-143/D-144): files approved extracted items into a Context
+- `src/routes/contexts.ts` — Context Library CRUD + tree (D-143/D-144): list/tree/create/get/patch/delete over `heediq-contexts`, keyed by the `by-scope` GSI (`scopeKey` = `U#<userId>`\|`G#<groupId>`\|`O#<orgId>`, `SK = domainCreatedAt`). `canAccessContext(c, item)` is the shared visibility gate (personal = owner-only, group = live-membership-checked against `heediq-role-assignments`, org = any org member) — also imported by `sources.ts`'s review route to gate against the target context
 - `src/routes/upload.ts` — `POST /api/v1/upload/presign` (S3 presigned URL)
 - `src/routes/auth.ts` — unauthenticated `/api/v1/auth` sub-app: `lookup-email` + D-087/D-089 cross-provider linking (`link/request-otp`, `link/verify-otp`, `link/confirm`)
 - `src/lib/cognito.ts` — Cognito Identity Provider SDK wrapper (`SignUp`, `ConfirmSignUp`, `ResendConfirmationCode`, `AdminSetUserPassword`, `AdminLinkProviderForUser`, `AdminDeleteUser`, `AdminCreateUser`, `ListUsers`) used by `routes/auth.ts` and the trigger handlers below
@@ -57,6 +58,8 @@ Client  →  API Gateway HTTP API  →  Lambda (Hono)
                  /me  →  DynamoDB (users + orgs tables)
              /sources  →  DynamoDB (sources table) + SQS (transcription queue)
        /sources/:id/jobs  →  D-060 check + DynamoDB (jobs table) + SQS enqueue
+ /sources/:id/review  →  canAccessContext gate + DynamoDB (extracted-items + contexts tables)
+            /contexts  →  DynamoDB (contexts table, by-scope GSI) + canAccessContext gate
    /upload/presign  →  S3 presigned PUT URL (client uploads directly to S3)
 ```
 
@@ -75,7 +78,15 @@ PATCH  /api/v1/sources/:id            { title? }
 DELETE /api/v1/sources/:id
 POST   /api/v1/sources/:id/jobs       { sourceId, model: 'small'|'large-v3' }
 GET    /api/v1/sources/:id/summary
+POST   /api/v1/sources/:id/review     { contextId, kept: string[] }  -> { keptCount, discardedCount }  (D-143/D-144, requires sources:update)
 POST   /api/v1/upload/presign         { sourceId, contentType, fileSizeBytes }
+
+GET    /api/v1/contexts?domain=<str>                                                        (D-143/D-144)
+GET    /api/v1/contexts/tree                                                                  (D-143/D-144)
+POST   /api/v1/contexts               { name, domain, visibility: 'personal'|'group'|'org', groupId?, parentContextId? }  (requires context:create)
+GET    /api/v1/contexts/:id                                                                   (D-143/D-144)
+PATCH  /api/v1/contexts/:id           { name?, visibility?, groupId?, parentContextId? }       (requires context:update)
+DELETE /api/v1/contexts/:id                                                                    (requires context:delete; 409 if it has children)
 
 POST   /api/v1/auth/lookup-email      { email } -> { exists, passwordSet }              (unauthenticated)
 POST   /api/v1/auth/link/request-otp  { email }  -> { sent: true }                       (unauthenticated, D-087)
@@ -160,6 +171,23 @@ methods are active on an account — `GET /auth/methods` is a straight `Query` o
 
 **`DELETE /api/v1/sources/:id` is a soft-delete:** sets `status='failed'` and writes `deletedAt` — does not remove the DynamoDB item. Hard delete is not implemented at MVP.
 
+**D-143/D-144 Context Library visibility gate:** every Context has a `visibility` of `personal`
+(owner only), `group` (any live member of `groupId`, re-checked per request against
+`heediq-role-assignments` — not baked into the JWT, since group membership can change between token
+refreshes), or `org` (any authenticated member of the org). `canAccessContext(c, item)` in
+`contexts.ts` is the single implementation of this check, imported by `sources.ts`'s review route so
+a review can only file items into a context the caller can actually see. `POST /contexts` with
+`visibility: 'group'` requires the *creating* caller to already be a member of `groupId` — the same
+membership check a reader would need, so a context is never created into a group its own owner
+can't read back. `parentContextId` supports one level of nesting for the tree view
+(`GET /contexts/tree`); a context with children returns `409 CONFLICT` on `DELETE` rather than
+cascading.
+
+**D-143/D-144 review-approval (`POST /sources/:id/review`):** takes `{ contextId, kept: string[] }`
+(item ids to keep — everything else extracted from that source is discarded) after gating with
+`canAccessContext` on the target context; writes an after-only `source:review` audit event via
+`auditWriter(c)` and returns `{ keptCount, discardedCount }`.
+
 **Response envelope:** `{ ok: true, data: T }` | `{ ok: false, error: { code, message, details? } }`
 
 **API version prefix (D-088):** `/api/v1/` is written in exactly one place — the two `app.route()`
@@ -170,28 +198,30 @@ new router follows the same pattern — mount it in `app.ts`, don't hardcode the
 ## Dependencies
 
 - Upstream: `heediq-infra` (Lambda + API Gateway + DynamoDB + S3 + SQS must exist before deploy, D-050)
-- Upstream: `@heediq/shared` (Zod schemas + types, D-033) — pinned to `^0.13.0` (D-085/D-093 `createLogger` structured logger, mandatory per D-093; `passwordPolicy.ts`'s `isPasswordPolicyCompliant` is consumed in `routes/auth.ts`'s `/link/confirm`, D-094; D-102 adds the 5 RBAC request schemas and `buildAuditLogEntry()`, consumed by `routes/roles.ts`/`groups.ts`/`role-assignments.ts` and `lib/audit.ts`; D-114 adds `audit.ts`'s `effect` field and `permission` resourceType, consumed by `middleware/rbac.ts`)
+- Upstream: `@heediq/shared` (Zod schemas + types, D-033) — pinned to `^0.15.1` (D-085/D-093 `createLogger` structured logger, mandatory per D-093; `passwordPolicy.ts`'s `isPasswordPolicyCompliant` is consumed in `routes/auth.ts`'s `/link/confirm`, D-094; D-102 adds the 5 RBAC request schemas and `buildAuditLogEntry()`, consumed by `routes/roles.ts`/`groups.ts`/`role-assignments.ts` and `lib/audit.ts`; D-114 adds `audit.ts`'s `effect` field and `permission` resourceType, consumed by `middleware/rbac.ts`; D-143/D-144 adds `Create/UpdateContextRequestSchema`, `ReviewApprovalRequestSchema`, `ExtractedItemSchema`, and the `context`/`extractedItemReview` `AuditPayloadMap` entries, consumed by `routes/contexts.ts` and the review route in `routes/sources.ts`)
+- Upstream: `heediq-infra`'s `heediq-contexts`/`heediq-extracted-items` tables + GSIs (D-143/D-144, ApiStack IAM grants + env vars)
 - Downstream: `heediq-worker-transcription` (reads SQS messages enqueued here). `config.ts` also reads `SUMMARIZATION_QUEUE_URL`, but no route currently sends to it — the text-upload → summarization-queue direct path isn't wired up yet.
-- Shared surfaces: `heediq-sources`, `heediq-jobs` DynamoDB tables
+- Shared surfaces: `heediq-sources`, `heediq-jobs`, `heediq-contexts`, `heediq-extracted-items` DynamoDB tables
 - Upstream (auth): `heediq-infra`'s `UserAuthMethodsTable`/`AuthAuditLogTable` (D-087) and the Cognito User Pool triggers wired to the 3 `auth-trigger-*.ts` handlers — see `heediq-infra/README.md`
 - Upstream (auth): `heediq-infra`'s `heediq-rate-limits` table (D-097) backing `src/lib/rateLimit.ts`
 
 ## Testing
 
 ```bash
-pnpm run test          # 204 unit tests (auth routes + auth methods + settings link + auth triggers + sources + app routing + rate limiting + roles + groups + role-assignments + rbac + rbac-middleware + me + users + wsPush + ws-connect + ws-pusher + classification-pusher)
+pnpm run test          # 235 unit tests (auth routes + auth methods + settings link + auth triggers + sources + contexts + app routing + rate limiting + roles + groups + role-assignments + rbac + rbac-middleware + me + users + wsPush + ws-connect + ws-pusher + classification-pusher)
 pnpm run typecheck     # tsc --noEmit
 pnpm run test:pre-pr   # typecheck + test (run before opening a PR)
 pnpm run dev           # local dev server on :3000 (tsx watch)
 ```
 
 `pnpm run dev` calls `requireEnv()` in `config.ts` at cold start and crashes immediately if any of
-these 19 vars are unset — all real AWS resources deployed by `heediq-infra`, no local fakes:
+these 21 vars are unset — all real AWS resources deployed by `heediq-infra`, no local fakes:
 `COGNITO_USER_POOL_ID`, `COGNITO_CLIENT_ID`, `SOURCES_TABLE_NAME`, `ORGS_TABLE_NAME`,
 `USERS_TABLE_NAME`, `JOBS_TABLE_NAME`, `WS_CONNECTIONS_TABLE_NAME`, `USER_AUTH_METHODS_TABLE_NAME`,
 `AUTH_AUDIT_LOG_TABLE_NAME`, `RATE_LIMITS_TABLE_NAME`, `COGNITO_IDENTITIES_TABLE_NAME`,
 `AUDIO_BUCKET_NAME`, `TRANSCRIPTION_QUEUE_URL`, `SUMMARIZATION_QUEUE_URL`, `ROLES_TABLE_NAME`,
 `GROUPS_TABLE_NAME`, `ROLE_ASSIGNMENTS_TABLE_NAME`, `AUDIT_LOG_TABLE_NAME`,
+`CONTEXTS_TABLE_NAME`, `EXTRACTED_ITEMS_TABLE_NAME`,
 `WS_MANAGEMENT_ENDPOINT` (D-109). Pull the actual values
 from the deployed `dev` account (SSM params / CDK stack outputs, see `heediq-infra/README.md`) into
 a local `.env` and export before running `dev`.

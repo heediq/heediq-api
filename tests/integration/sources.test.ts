@@ -59,8 +59,8 @@ async function seedTestOrg(overrides: { plan?: 'free' | 'paid' } = {}) {
 }
 
 // PATCH/DELETE resolve the owner's email via a real users-table lookup (sources.ts
-// resolveOwnerEmail), so the acting user needs a seeded row — an unseeded userId falls back to
-// the literal 'unknown', which fails @heediq/shared's email-format audit payload validation.
+// resolveOwnerEmail) for the audit payload — seeded here so most tests exercise the real
+// lookup path rather than its unseeded fallback (see the dedicated regression test below).
 async function seedTestUser(orgId: string, role: 'admin' | 'member' = 'admin') {
   const user = seedUser(tables, { orgId, role })
   await user.write()
@@ -163,6 +163,25 @@ describe('sources CRUD + pagination (integration, DynamoDB Local)', () => {
 
     const missingRes = await app.request(`/${randomUUID()}`, { method: 'DELETE' })
     expect(missingRes.status).toBe(404)
+  })
+
+  // Regression: resolveOwnerEmail's fallback for a userId missing from heediq-users used to be the
+  // literal string 'unknown', which fails @heediq/shared's z.string().email() audit validation and
+  // 500s the request — not just a test artifact, since a real deleted-user row hits this in prod.
+  it('updates and deletes a source when the acting user has no heediq-users row', async () => {
+    const orgId = await seedTestOrg()
+    const app = makeApp(orgId, randomUUID(), 'admin') // no seedTestUser — userId is unseeded
+    const sourceId = await createSource(app)
+
+    const updateRes = await app.request(`/${sourceId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Renamed' }),
+    })
+    expect(updateRes.status).toBe(200)
+
+    const deleteRes = await app.request(`/${sourceId}`, { method: 'DELETE' })
+    expect(deleteRes.status).toBe(200)
   })
 
   it('returns 404 for a summary that is not yet available', async () => {

@@ -43,9 +43,12 @@ function isAwsError(err: unknown): err is { name: string } {
 // Audit entries are human-readable and self-contained (D-102), so a source mutation needs the
 // owner's email even though the actor (who may have org-wide sources:update/delete) can differ
 // from the source's userId — resolved via the users table rather than assumed to be the caller.
+// Falls back to a synthetic but valid-format address (never the literal 'unknown') for an owner
+// row that's missing (e.g. a deleted account) — @heediq/shared's audit payload requires
+// z.string().email(), so an invalid fallback would 500 the mutation instead of just the audit note.
 async function resolveOwnerEmail(userId: string): Promise<string> {
   const res = await dynamo.send(new GetCommand({ TableName: config.dynamo.usersTable, Key: { userId } }))
-  return (res.Item?.['email'] as string) ?? 'unknown'
+  return (res.Item?.['email'] as string) ?? `unknown-user+${userId}@heediq.internal`
 }
 
 // GET /api/v1/sources — list org sources, cursor-paginated
