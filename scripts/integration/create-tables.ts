@@ -74,6 +74,31 @@ const TABLES: TableDef[] = [
     sortKey: 'sk',
     gsis: [{ indexName: 'by-user', partitionKey: 'actorUserId', sortKey: 'sk' }],
   },
+  // ── Context Library tables (D-124–D-143) ──
+  {
+    tableName: 'heediq-contexts',
+    partitionKey: 'contextId',
+    gsis: [{ indexName: 'by-scope', partitionKey: 'scopeKey', sortKey: 'domainCreatedAt' }],
+  },
+  {
+    tableName: 'heediq-extracted-items',
+    partitionKey: 'sourceId',
+    sortKey: 'itemId',
+    gsis: [{ indexName: 'by-context', partitionKey: 'contextId', sortKey: 'itemId' }],
+  },
+  { tableName: 'heediq-decision-ledger', partitionKey: 'contextId', sortKey: 'entryId' },
+  {
+    tableName: 'heediq-conversations',
+    partitionKey: 'conversationId',
+    gsis: [{ indexName: 'by-context', partitionKey: 'contextId', sortKey: 'updatedAt' }],
+  },
+  { tableName: 'heediq-chat-messages', partitionKey: 'conversationId', sortKey: 'sk' },
+  {
+    tableName: 'heediq-context-grants',
+    partitionKey: 'granteeUserId',
+    sortKey: 'contextId',
+    gsis: [{ indexName: 'by-context', partitionKey: 'contextId', sortKey: 'granteeUserId' }],
+  },
 ]
 
 function toCreateTableInput(def: TableDef): CreateTableCommandInput {
