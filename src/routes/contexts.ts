@@ -10,6 +10,7 @@ import { requirePermission } from '../middleware/rbac.js'
 import type { RequestIdContext } from '../middleware/request-id.js'
 import {
   ContextSchema,
+  ContextGrantSchema,
   CreateContextRequestSchema,
   UpdateContextRequestSchema,
   createLogger,
@@ -52,16 +53,48 @@ async function callerGroupIds(orgId: string, userId: string): Promise<Set<string
   return new Set((res.Items ?? []).map((i) => (i['sk'] as string).slice('GROUP#'.length)))
 }
 
+const GRANT_ACCESS_RANK: Record<'read' | 'contribute', number> = { read: 0, contribute: 1 }
+
+// A grant is checked live against DynamoDB on every call (never cached in the JWT, D-142) —
+// unlike requirePermission's in-token check, cross-org access must reflect a revoke immediately.
+// TTL on `heediq-context-grants` is cleanup-only (D-097 precedent): DynamoDB's TTL sweep can lag
+// up to 48h, so an expired-but-not-yet-swept row must still be rejected here, not trusted as absent.
+async function hasActiveGrant(granteeUserId: string, contextId: string, minAccess: 'read' | 'contribute'): Promise<boolean> {
+  const res = await dynamo.send(new GetCommand({
+    TableName: config.dynamo.contextGrantsTable,
+    Key: { granteeUserId, contextId },
+  }))
+  if (!res.Item) return false
+  const grant = ContextGrantSchema.parse(res.Item)
+  if (grant.expiresAt <= Math.floor(Date.now() / 1000)) return false
+  return GRANT_ACCESS_RANK[grant.access] >= GRANT_ACCESS_RANK[minAccess]
+}
+
 // Visibility gate for a specific Context instance (D-141): personal is owner-only regardless of
 // org-wide context:* permissions — a member with context:update can't edit someone else's private
 // notebook. Group requires live membership; org is open to any org member (already isolated by
 // isSameOrg above).
-export async function canAccessContext(c: { get: (k: 'orgId' | 'userId') => string }, item: ContextItem): Promise<boolean> {
-  if (!isSameOrg(c.get('orgId'), item)) return false
-  if (item.visibility === 'org') return true
-  if (item.visibility === 'personal') return item.userId === c.get('userId')
-  const groups = await callerGroupIds(c.get('orgId'), c.get('userId'))
-  return item.userId === c.get('userId') || (item.groupId !== undefined && groups.has(item.groupId))
+//
+// `minAccess` is deliberately omitted by PATCH/DELETE (stays undefined there) so a cross-org grant
+// can never authorize mutating the Context entity itself (D-142) — only routes that pass it (the
+// GET fetch, and sources.ts's review-approval route at 'contribute') fall through to a live grant
+// lookup when the caller isn't the owner/org/group member.
+export async function canAccessContext(
+  c: { get: (k: 'orgId' | 'userId') => string },
+  item: ContextItem,
+  minAccess?: 'read' | 'contribute',
+): Promise<boolean> {
+  if (isSameOrg(c.get('orgId'), item)) {
+    if (item.visibility === 'org') return true
+    if (item.visibility === 'personal') {
+      if (item.userId === c.get('userId')) return true
+    } else {
+      const groups = await callerGroupIds(c.get('orgId'), c.get('userId'))
+      if (item.userId === c.get('userId') || (item.groupId !== undefined && groups.has(item.groupId))) return true
+    }
+  }
+  if (minAccess === undefined) return false
+  return hasActiveGrant(c.get('userId'), item.contextId, minAccess)
 }
 
 // GET /api/v1/contexts — personal (own) + org-visible Contexts, optionally filtered to one
@@ -204,7 +237,7 @@ contexts.get('/:id', async (c) => {
     return apiError(c, 'NOT_FOUND', 'Context not found')
   }
   const item = ContextSchema.parse(res.Item)
-  if (!(await canAccessContext(c, item))) {
+  if (!(await canAccessContext(c, item, 'read'))) {
     return apiError(c, 'NOT_FOUND', 'Context not found')
   }
   return ok(c, { context: item })

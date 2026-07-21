@@ -10,6 +10,7 @@ vi.mock('../config.js', () => ({
     dynamo: {
       contextsTable: 'heediq-contexts',
       extractedItemsTable: 'heediq-extracted-items',
+      contextGrantsTable: 'heediq-context-grants',
       roleAssignmentsTable: 'heediq-role-assignments',
       auditLogTable: 'heediq-audit-log',
     },
@@ -18,7 +19,7 @@ vi.mock('../config.js', () => ({
 
 vi.mock('../lib/dynamo.js', () => ({ dynamo: { send: mockDynamoSend } }))
 
-import { contextsRouter } from '../routes/contexts.js'
+import { contextsRouter, canAccessContext } from '../routes/contexts.js'
 
 function makeApp(opts: { userId?: string; orgId?: string; role?: 'admin' | 'member'; permissions?: Permission[] } = {}) {
   const app = new Hono<AuthContext>()
@@ -187,13 +188,17 @@ describe('GET /contexts/:id', () => {
   })
 
   it('returns 404 for a personal context owned by someone else (cross-user isolation)', async () => {
-    mockDynamoSend.mockResolvedValueOnce({ Item: personalContext({ userId: otherUserId }) })
+    mockDynamoSend
+      .mockResolvedValueOnce({ Item: personalContext({ userId: otherUserId }) })
+      .mockResolvedValueOnce({}) // hasActiveGrant fallback — no grant row
     const res = await makeApp().request(`/${contextId}`)
     expect(res.status).toBe(404)
   })
 
   it('returns 404 for a context belonging to a different org (cross-org isolation)', async () => {
-    mockDynamoSend.mockResolvedValueOnce({ Item: personalContext({ orgId: otherOrgId, userId: otherUserId, visibility: 'org' }) })
+    mockDynamoSend
+      .mockResolvedValueOnce({ Item: personalContext({ orgId: otherOrgId, userId: otherUserId, visibility: 'org' }) })
+      .mockResolvedValueOnce({}) // hasActiveGrant fallback — no grant row
     const res = await makeApp().request(`/${contextId}`)
     expect(res.status).toBe(404)
   })
@@ -216,8 +221,80 @@ describe('GET /contexts/:id', () => {
     mockDynamoSend
       .mockResolvedValueOnce({ Item: personalContext({ userId: otherUserId, visibility: 'group', groupId }) })
       .mockResolvedValueOnce({ Items: [] }) // callerGroupIds — no memberships
+      .mockResolvedValueOnce({}) // hasActiveGrant fallback — no grant row
     const res = await makeApp().request(`/${contextId}`)
     expect(res.status).toBe(404)
+  })
+})
+
+describe('canAccessContext — cross-org grants (D-142)', () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  const grantContext = { get: (k: 'orgId' | 'userId') => (k === 'orgId' ? orgId : userId) }
+  const crossOrgItem = personalContext({ orgId: otherOrgId, userId: otherUserId, visibility: 'org' })
+
+  function grant(overrides: Record<string, unknown> = {}) {
+    return {
+      contextId,
+      granteeUserId: userId,
+      granteeOrgId: orgId,
+      ownerOrgId: otherOrgId,
+      grantedByUserId: otherUserId,
+      access: 'read',
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      createdAt: now,
+      updatedAt: now,
+      ...overrides,
+    }
+  }
+
+  it('rejects a cross-org item when minAccess is undefined, even with an active grant (PATCH/DELETE never consult grants)', async () => {
+    const allowed = await canAccessContext(grantContext, crossOrgItem)
+    expect(allowed).toBe(false)
+    expect(mockDynamoSend).not.toHaveBeenCalled()
+  })
+
+  it('grants read access via an active grant when same-org/visibility checks fail', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Item: grant() })
+    const allowed = await canAccessContext(grantContext, crossOrgItem, 'read')
+    expect(allowed).toBe(true)
+  })
+
+  it('rejects when no grant row exists', async () => {
+    mockDynamoSend.mockResolvedValueOnce({})
+    const allowed = await canAccessContext(grantContext, crossOrgItem, 'read')
+    expect(allowed).toBe(false)
+  })
+
+  it('rejects an expired grant despite the row still existing (TTL sweep lag, D-097 precedent)', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Item: grant({ expiresAt: Math.floor(Date.now() / 1000) - 10 }) })
+    const allowed = await canAccessContext(grantContext, crossOrgItem, 'read')
+    expect(allowed).toBe(false)
+  })
+
+  it('rejects a read-tier grant when contribute access is required', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Item: grant({ access: 'read' }) })
+    const allowed = await canAccessContext(grantContext, crossOrgItem, 'contribute')
+    expect(allowed).toBe(false)
+  })
+
+  it('a contribute-tier grant satisfies a read minAccess requirement (rank comparison)', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Item: grant({ access: 'contribute' }) })
+    const allowed = await canAccessContext(grantContext, crossOrgItem, 'read')
+    expect(allowed).toBe(true)
+  })
+
+  it('a contribute-tier grant satisfies a contribute minAccess requirement', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Item: grant({ access: 'contribute' }) })
+    const allowed = await canAccessContext(grantContext, crossOrgItem, 'contribute')
+    expect(allowed).toBe(true)
+  })
+
+  it('does not consult the grant table when the caller already has same-org access', async () => {
+    const orgItem = personalContext({ userId: otherUserId, visibility: 'org' })
+    const allowed = await canAccessContext(grantContext, orgItem, 'read')
+    expect(allowed).toBe(true)
+    expect(mockDynamoSend).not.toHaveBeenCalled()
   })
 })
 

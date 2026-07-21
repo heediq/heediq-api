@@ -24,7 +24,8 @@ All Heediq REST endpoints in a single Lambda function. Handles auth, Source CRUD
 - `src/routes/me.ts` — `GET /api/v1/me`; response includes `effectivePermissions` (D-102/D-105), the server-resolved permission set already parsed by `authMiddleware` from the `custom:permissions` JWT claim — the only source of authority `heediq-web`'s `usePermissions`/`<Can>` are allowed to read
 - `src/routes/users.ts` — `GET /api/v1/users` — org-scoped user list (D-102 Phase 4), used by the role/group assignment screen; read-open to any authenticated org member, same posture as `GET /roles`/`GET /groups`
 - `src/routes/sources.ts` — Source CRUD + job enqueue + summary fetch (D-068) + `POST /:id/review` (D-143/D-144): files approved extracted items into a Context
-- `src/routes/contexts.ts` — Context Library CRUD + tree (D-143/D-144): list/tree/create/get/patch/delete over `heediq-contexts`, keyed by the `by-scope` GSI (`scopeKey` = `U#<userId>`\|`G#<groupId>`\|`O#<orgId>`, `SK = domainCreatedAt`). `canAccessContext(c, item)` is the shared visibility gate (personal = owner-only, group = live-membership-checked against `heediq-role-assignments`, org = any org member) — also imported by `sources.ts`'s review route to gate against the target context
+- `src/routes/contexts.ts` — Context Library CRUD + tree (D-143/D-144): list/tree/create/get/patch/delete over `heediq-contexts`, keyed by the `by-scope` GSI (`scopeKey` = `U#<userId>`\|`G#<groupId>`\|`O#<orgId>`, `SK = domainCreatedAt`). `canAccessContext(c, item, minAccess?)` is the shared visibility gate (personal = owner-only, group = live-membership-checked against `heediq-role-assignments`, org = any org member); when the caller fails every same-org/visibility check and `minAccess` (`'read'`\|`'contribute'`) is passed, it falls through to `hasActiveGrant()` — a live `heediq-context-grants` lookup (D-142). PATCH/DELETE never pass `minAccess`, so a cross-org grant can never authorize mutating the Context entity itself; only `GET /:id` (at `'read'`) and `sources.ts`'s review route (at `'contribute'`) opt in. Also imported by `context-grants.ts` to gate grant issuance/listing against the target context.
+- `src/routes/context-grants.ts` — Cross-org Context grant issuance/revoke (D-142): `POST /api/v1/context-grants?contextId=` resolves `granteeEmail` to an existing account via `heediq-users`' `by-email` GSI (existing-accounts-only — no invite flow yet) and writes a `heediq-context-grants` row; `GET /api/v1/context-grants?contextId=` lists grants on a Context the caller can see (owner-side view, via the `by-context` GSI); `GET /api/v1/context-grants/shared-with-me` lists the caller's own live (non-expired) grants across every owner org; `DELETE /api/v1/context-grants/:contextId/:granteeUserId` hard-deletes the row — there is no `status`/`revokedAt`, the audited `DELETE` action is the historical record. All routes but `shared-with-me` are gated by `requirePermission('context:share')` (admin/owner-only, D-141).
 - `src/routes/upload.ts` — `POST /api/v1/upload/presign` (S3 presigned URL)
 - `src/routes/auth.ts` — unauthenticated `/api/v1/auth` sub-app: `lookup-email` + D-087/D-089 cross-provider linking (`link/request-otp`, `link/verify-otp`, `link/confirm`)
 - `src/lib/cognito.ts` — Cognito Identity Provider SDK wrapper (`SignUp`, `ConfirmSignUp`, `ResendConfirmationCode`, `AdminSetUserPassword`, `AdminLinkProviderForUser`, `AdminDeleteUser`, `AdminCreateUser`, `ListUsers`) used by `routes/auth.ts` and the trigger handlers below
@@ -58,8 +59,9 @@ Client  →  API Gateway HTTP API  →  Lambda (Hono)
                  /me  →  DynamoDB (users + orgs tables)
              /sources  →  DynamoDB (sources table) + SQS (transcription queue)
        /sources/:id/jobs  →  D-060 check + DynamoDB (jobs table) + SQS enqueue
- /sources/:id/review  →  canAccessContext gate + DynamoDB (extracted-items + contexts tables)
-            /contexts  →  DynamoDB (contexts table, by-scope GSI) + canAccessContext gate
+ /sources/:id/review  →  canAccessContext('contribute') gate + DynamoDB (extracted-items + contexts + context-grants tables)
+            /contexts  →  DynamoDB (contexts table, by-scope GSI) + canAccessContext gate (GET /:id also checks context-grants)
+       /context-grants  →  DynamoDB (context-grants table, by-context GSI) + canAccessContext gate + by-email GSI (heediq-users)
    /upload/presign  →  S3 presigned PUT URL (client uploads directly to S3)
 ```
 
@@ -87,6 +89,11 @@ POST   /api/v1/contexts               { name, domain, visibility: 'personal'|'gr
 GET    /api/v1/contexts/:id                                                                   (D-143/D-144)
 PATCH  /api/v1/contexts/:id           { name?, visibility?, groupId?, parentContextId? }       (requires context:update)
 DELETE /api/v1/contexts/:id                                                                    (requires context:delete; 409 if it has children)
+
+POST   /api/v1/context-grants?contextId=<id>   { granteeEmail, access: 'read'|'contribute', expiresAt }  -> { grant }  (D-142, requires context:share)
+GET    /api/v1/context-grants?contextId=<id>                                                  -> { grants }  (D-142, requires context:share)
+GET    /api/v1/context-grants/shared-with-me                                                  -> { grants }  (D-142, authenticated only — caller's own grants)
+DELETE /api/v1/context-grants/:contextId/:granteeUserId                                       -> { revoked: true }  (D-142, requires context:share)
 
 POST   /api/v1/auth/lookup-email      { email } -> { exists, passwordSet }              (unauthenticated)
 POST   /api/v1/auth/link/request-otp  { email }  -> { sent: true }                       (unauthenticated, D-087)
@@ -185,8 +192,22 @@ cascading.
 
 **D-143/D-144 review-approval (`POST /sources/:id/review`):** takes `{ contextId, kept: string[] }`
 (item ids to keep — everything else extracted from that source is discarded) after gating with
-`canAccessContext` on the target context; writes an after-only `source:review` audit event via
-`auditWriter(c)` and returns `{ keptCount, discardedCount }`.
+`canAccessContext(c, context, 'contribute')` on the target context (so a cross-org `'contribute'`
+grantee, not just a same-org member, can file items — a `'read'`-only grantee is rejected); writes an
+after-only `source:review` audit event via `auditWriter(c)` and returns `{ keptCount, discardedCount }`.
+
+**D-142 cross-org Context grants (`context-grants.ts`):** a regulated cross-org share of a single
+Context, existing-accounts-only (no invite/magic-link flow yet). `heediq-context-grants`' key IS the
+grant's identity — PK=`granteeUserId`, SK=`contextId` (at most one active grant per grantee+context;
+re-sharing overwrites it, no separate history). Two tiers, `'read'` and `'contribute'` (contribute
+implies read). **No `status`/`revokedAt`** — revoke is a hard `DELETE`; the audited delete action is
+the historical record. Every check (`hasActiveGrant()` in `contexts.ts`) reads DynamoDB live on each
+request — never cached in the JWT, so a revoke takes effect immediately. `expiresAt` (epoch seconds)
+is also the table's TTL attribute, but TTL is cleanup-only: the sweep can lag, so `hasActiveGrant()`
+independently rejects an expired-but-not-yet-swept row rather than trusting its absence (D-097
+`heediq-rate-limits` precedent). Issuing/listing a grant (not `shared-with-me`) is gated by
+`requirePermission('context:share')`, which is deliberately withheld from the default `member` seed
+role (admin/owner-only, D-141) — see `@heediq/shared`'s `permissions.ts`.
 
 **Response envelope:** `{ ok: true, data: T }` | `{ ok: false, error: { code, message, details? } }`
 
@@ -198,30 +219,30 @@ new router follows the same pattern — mount it in `app.ts`, don't hardcode the
 ## Dependencies
 
 - Upstream: `heediq-infra` (Lambda + API Gateway + DynamoDB + S3 + SQS must exist before deploy, D-050)
-- Upstream: `@heediq/shared` (Zod schemas + types, D-033) — pinned to `^0.15.1` (D-085/D-093 `createLogger` structured logger, mandatory per D-093; `passwordPolicy.ts`'s `isPasswordPolicyCompliant` is consumed in `routes/auth.ts`'s `/link/confirm`, D-094; D-102 adds the 5 RBAC request schemas and `buildAuditLogEntry()`, consumed by `routes/roles.ts`/`groups.ts`/`role-assignments.ts` and `lib/audit.ts`; D-114 adds `audit.ts`'s `effect` field and `permission` resourceType, consumed by `middleware/rbac.ts`; D-143/D-144 adds `Create/UpdateContextRequestSchema`, `ReviewApprovalRequestSchema`, `ExtractedItemSchema`, and the `context`/`extractedItemReview` `AuditPayloadMap` entries, consumed by `routes/contexts.ts` and the review route in `routes/sources.ts`)
-- Upstream: `heediq-infra`'s `heediq-contexts`/`heediq-extracted-items` tables + GSIs (D-143/D-144, ApiStack IAM grants + env vars)
+- Upstream: `@heediq/shared` (Zod schemas + types, D-033) — pinned to `^0.15.2` (D-085/D-093 `createLogger` structured logger, mandatory per D-093; `passwordPolicy.ts`'s `isPasswordPolicyCompliant` is consumed in `routes/auth.ts`'s `/link/confirm`, D-094; D-102 adds the 5 RBAC request schemas and `buildAuditLogEntry()`, consumed by `routes/roles.ts`/`groups.ts`/`role-assignments.ts` and `lib/audit.ts`; D-114 adds `audit.ts`'s `effect` field and `permission` resourceType, consumed by `middleware/rbac.ts`; D-143/D-144 adds `Create/UpdateContextRequestSchema`, `ReviewApprovalRequestSchema`, `ExtractedItemSchema`, and the `context`/`extractedItemReview` `AuditPayloadMap` entries, consumed by `routes/contexts.ts` and the review route in `routes/sources.ts`; D-142 (0.15.2) fixes `ContextGrantSchema.expiresAt` to epoch-seconds and adds `CreateContextGrantRequestSchema` + the `contextGrant` `AuditPayloadMap` entry, consumed by `routes/context-grants.ts`)
+- Upstream: `heediq-infra`'s `heediq-contexts`/`heediq-extracted-items`/`heediq-context-grants` tables + GSIs (D-143/D-144/D-142, ApiStack IAM grants + env vars)
 - Downstream: `heediq-worker-transcription` (reads SQS messages enqueued here). `config.ts` also reads `SUMMARIZATION_QUEUE_URL`, but no route currently sends to it — the text-upload → summarization-queue direct path isn't wired up yet.
-- Shared surfaces: `heediq-sources`, `heediq-jobs`, `heediq-contexts`, `heediq-extracted-items` DynamoDB tables
+- Shared surfaces: `heediq-sources`, `heediq-jobs`, `heediq-contexts`, `heediq-extracted-items`, `heediq-context-grants` DynamoDB tables
 - Upstream (auth): `heediq-infra`'s `UserAuthMethodsTable`/`AuthAuditLogTable` (D-087) and the Cognito User Pool triggers wired to the 3 `auth-trigger-*.ts` handlers — see `heediq-infra/README.md`
 - Upstream (auth): `heediq-infra`'s `heediq-rate-limits` table (D-097) backing `src/lib/rateLimit.ts`
 
 ## Testing
 
 ```bash
-pnpm run test          # 235 unit tests (auth routes + auth methods + settings link + auth triggers + sources + contexts + app routing + rate limiting + roles + groups + role-assignments + rbac + rbac-middleware + me + users + wsPush + ws-connect + ws-pusher + classification-pusher)
+pnpm run test          # 243 unit tests (auth routes + auth methods + settings link + auth triggers + sources + contexts (incl. cross-org grant access) + app routing + rate limiting + roles + groups + role-assignments + rbac + rbac-middleware + me + users + wsPush + ws-connect + ws-pusher + classification-pusher)
 pnpm run typecheck     # tsc --noEmit
 pnpm run test:pre-pr   # typecheck + test (run before opening a PR)
 pnpm run dev           # local dev server on :3000 (tsx watch)
 ```
 
 `pnpm run dev` calls `requireEnv()` in `config.ts` at cold start and crashes immediately if any of
-these 21 vars are unset — all real AWS resources deployed by `heediq-infra`, no local fakes:
+these 22 vars are unset — all real AWS resources deployed by `heediq-infra`, no local fakes:
 `COGNITO_USER_POOL_ID`, `COGNITO_CLIENT_ID`, `SOURCES_TABLE_NAME`, `ORGS_TABLE_NAME`,
 `USERS_TABLE_NAME`, `JOBS_TABLE_NAME`, `WS_CONNECTIONS_TABLE_NAME`, `USER_AUTH_METHODS_TABLE_NAME`,
 `AUTH_AUDIT_LOG_TABLE_NAME`, `RATE_LIMITS_TABLE_NAME`, `COGNITO_IDENTITIES_TABLE_NAME`,
 `AUDIO_BUCKET_NAME`, `TRANSCRIPTION_QUEUE_URL`, `SUMMARIZATION_QUEUE_URL`, `ROLES_TABLE_NAME`,
 `GROUPS_TABLE_NAME`, `ROLE_ASSIGNMENTS_TABLE_NAME`, `AUDIT_LOG_TABLE_NAME`,
-`CONTEXTS_TABLE_NAME`, `EXTRACTED_ITEMS_TABLE_NAME`,
+`CONTEXTS_TABLE_NAME`, `EXTRACTED_ITEMS_TABLE_NAME`, `CONTEXT_GRANTS_TABLE_NAME`,
 `WS_MANAGEMENT_ENDPOINT` (D-109). Pull the actual values
 from the deployed `dev` account (SSM params / CDK stack outputs, see `heediq-infra/README.md`) into
 a local `.env` and export before running `dev`.
@@ -244,7 +265,10 @@ resourceType filter + cross-org isolation, cursor round-trip), and the RBAC/sour
 surfaces: `routes/roles.ts`, `routes/groups.ts` (including cross-org roleId rejection and roleId
 dedup), `routes/role-assignments.ts`, and `routes/sources.ts` (list/pagination/`ownSourcesOnly`
 scoping, update/delete existence checks, D-060 tier gating on job enqueue with
-`@aws-sdk/client-sqs` mocked since SQS is outside DynamoDB Local's scope). Route-level tests use
+`@aws-sdk/client-sqs` mocked since SQS is outside DynamoDB Local's scope), and `routes/context-grants.ts`
+(D-142 — grant issuance/listing/revoke, cross-org-only enforcement, `context:share` permission gate,
+a `'read'` grant rejected for a `'contribute'`-tier action, immediate loss of access on revoke, and
+owner-org isolation on revoke). Route-level tests use
 the same synthetic-auth-middleware pattern as the mocked unit tests (mount the router directly, set
 `userId`/`orgId`/`role`/`permissions` on context), just against the real `dynamo` client.
 `tests/integration/scenarios/rbac-journey.test.ts` chains role → group → assignment →
@@ -279,4 +303,5 @@ way.
 - **D-102 Phase 5 audit-log read path (`routes/audit-log.ts`):** `GET /org/audit-log` queries the base table (`pk = ORG#<orgId>`) by default, or the `by-user` GSI when `actorUserId` is given — the GSI query always adds `orgId = :orgId` to the `FilterExpression` too, as explicit cross-org defense-in-depth even though a user belongs to exactly one org today. The Lambda's IAM grant on this table is `Query` + write only — `GetItem`/`Scan` remain blocked (`heediq-infra` `api-stack.ts`), preserving the "no full-table read" posture from Phase 2. `action` is a DynamoDB reserved keyword — its `FilterExpression` clause must go through `ExpressionAttributeNames` (`#action`); a mocked `dynamo.send()` unit test can't catch a missed case like this, which is what the integration test layer below is for.
 - **`create-tables.ts` mirrors `heediq-infra/lib/foundation/tables.ts` by hand:** table/GSI definitions are duplicated, not imported, since `heediq-infra` isn't a runtime dependency of this repo. This can silently drift — if a table/GSI changes in `heediq-infra`, `create-tables.ts` must be updated too, or integration tests will pass locally against a schema real AWS no longer has. Flagged as a cross-repo drift-risk check item in `claude-workspace/rules/10-consistency-check.md`.
 - **`dynamo.ts` respects `DYNAMODB_ENDPOINT`:** only ever set by `tests/integration/setup-env.ts` — unset in every deployed Lambda env, so production always targets real AWS DynamoDB.
+- **`@heediq/shared@0.15.2` consumed via `pnpm link` pending publish:** the `ContextGrantSchema.expiresAt` TTL fix + grant request/audit schemas (D-142) are committed on `heediq-shared`'s `feature/context-library-grants` branch but not yet published to GitHub Packages (that requires a `develop`→`main` release PR). Until that PR merges, this repo resolves `^0.15.2` via a local `pnpm link ../heediq-shared` — remove the link and re-run `pnpm install` once 0.15.2 is actually published.
 - **D-105 permission staleness is bounded by token lifetime, not instant:** since `custom:permissions` is baked into the JWT at issuance rather than checked per-request against DynamoDB, a permission change (role edit, reassignment) only takes effect for a given user on their next token refresh — not immediately. This is a deliberate tradeoff (see `DECISIONS.md` D-105) in exchange for zero added DynamoDB reads on the request hot path.

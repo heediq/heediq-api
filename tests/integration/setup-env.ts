@@ -28,6 +28,7 @@ const placeholders: Record<string, string> = {
   AUDIT_LOG_TABLE_NAME: 'heediq-audit-log',
   CONTEXTS_TABLE_NAME: 'heediq-contexts',
   EXTRACTED_ITEMS_TABLE_NAME: 'heediq-extracted-items',
+  CONTEXT_GRANTS_TABLE_NAME: 'heediq-context-grants',
 }
 
 for (const [key, value] of Object.entries(placeholders)) {
