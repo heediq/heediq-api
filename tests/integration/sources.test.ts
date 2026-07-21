@@ -5,7 +5,7 @@ import { UpdateCommand } from '@aws-sdk/lib-dynamodb'
 import { DEFAULT_ORG_RBAC_SEED } from '@heediq/shared'
 import { dynamo } from '../../src/lib/dynamo.js'
 import { config } from '../../src/config.js'
-import { seedOrg, type IntegrationTables } from './seed.js'
+import { seedOrg, seedUser, type IntegrationTables } from './seed.js'
 import type { AuthContext } from '../../src/middleware/auth.js'
 import type { RequestIdContext } from '../../src/middleware/request-id.js'
 
@@ -58,6 +58,15 @@ async function seedTestOrg(overrides: { plan?: 'free' | 'paid' } = {}) {
   return org.orgId
 }
 
+// PATCH/DELETE resolve the owner's email via a real users-table lookup (sources.ts
+// resolveOwnerEmail), so the acting user needs a seeded row — an unseeded userId falls back to
+// the literal 'unknown', which fails @heediq/shared's email-format audit payload validation.
+async function seedTestUser(orgId: string, role: 'admin' | 'member' = 'admin') {
+  const user = seedUser(tables, { orgId, role })
+  await user.write()
+  return user.userId
+}
+
 async function createSource(app: Hono<AuthContext & RequestIdContext>, title = 'Test meeting') {
   const res = await app.request('/', {
     method: 'POST',
@@ -84,8 +93,8 @@ describe('sources CRUD + pagination (integration, DynamoDB Local)', () => {
     const orgId = await seedTestOrg()
     const ownerId = randomUUID()
     const otherId = randomUUID()
-    const ownerApp = makeApp(orgId, ownerId, 'member', [])
-    const otherApp = makeApp(orgId, otherId, 'member', [])
+    const ownerApp = makeApp(orgId, ownerId, 'member', ['sources:create'])
+    const otherApp = makeApp(orgId, otherId, 'member', ['sources:create'])
 
     await createSource(ownerApp, 'Owner source')
     await createSource(otherApp, 'Other source')
@@ -126,7 +135,7 @@ describe('sources CRUD + pagination (integration, DynamoDB Local)', () => {
 
   it('updates a source and returns 404 for one that does not exist', async () => {
     const orgId = await seedTestOrg()
-    const app = makeApp(orgId, randomUUID(), 'admin')
+    const app = makeApp(orgId, await seedTestUser(orgId), 'admin')
     const sourceId = await createSource(app)
 
     const updateRes = await app.request(`/${sourceId}`, {
@@ -146,7 +155,7 @@ describe('sources CRUD + pagination (integration, DynamoDB Local)', () => {
 
   it('soft-deletes a source and returns 404 for one that does not exist', async () => {
     const orgId = await seedTestOrg()
-    const app = makeApp(orgId, randomUUID(), 'admin')
+    const app = makeApp(orgId, await seedTestUser(orgId), 'admin')
     const sourceId = await createSource(app)
 
     const deleteRes = await app.request(`/${sourceId}`, { method: 'DELETE' })

@@ -33,8 +33,8 @@ importers:
         specifier: ^3.996.5
         version: 3.996.5(@aws-sdk/client-dynamodb@3.1075.0)
       '@heediq/shared':
-        specifier: ^0.14.0
-        version: 0.14.0
+        specifier: ^0.15.1
+        version: 0.15.1
       '@hono/node-server':
         specifier: ^2.0.6
         version: 2.0.6(hono@4.12.27)
@@ -630,8 +630,8 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@heediq/shared@0.14.0':
-    resolution: {integrity: sha512-AkqWKLTPYaUngMv9s9/Rpc+oF/4N1+OwUd2Ql+G8nTCHIuzx0//DcOO3O8XgwPvdSRG4WkcPdH9xHbHO3blUSw==, tarball: https://npm.pkg.github.com/download/@heediq/shared/0.14.0/8520eda2f05df98b2ecd0e61faf15a0d2c684c7c}
+  '@heediq/shared@0.15.1':
+    resolution: {integrity: sha512-FLdAipzUkBBWAHA0AYdxwSsfij4toIsnm/YNbn2QEiqDVc+cJFOuc7Ffuuzd3PsYTR7X8tS1Rqa3EUXiHOq5OA==, tarball: https://npm.pkg.github.com/download/@heediq/shared/0.15.1/602238e672a014620b4c472b8e1c27a5f6a998b0}
     engines: {node: '>=22'}
 
   '@hono/node-server@2.0.6':
@@ -1867,7 +1867,7 @@ snapshots:
   '@esbuild/win32-x64@0.28.1':
     optional: true
 
-  '@heediq/shared@0.14.0':
+  '@heediq/shared@0.15.1':
     dependencies:
       zod: 3.25.76
 

@@ -11,14 +11,18 @@ import { requirePermission } from '../middleware/rbac.js'
 import { config } from '../config.js'
 import type { AuthContext } from '../middleware/auth.js'
 import type { RequestIdContext } from '../middleware/request-id.js'
+import { canAccessContext } from './contexts.js'
 import {
   SourceSchema,
   JobSchema,
   SummarySchema,
+  ContextSchema,
+  ExtractedItemSchema,
   CreateSourceRequestSchema,
   UpdateSourceRequestSchema,
   EnqueueJobRequestSchema,
   PresignUploadRequestSchema,
+  ReviewApprovalRequestSchema,
   createLogger,
   type Source,
   type TranscriptionJobMessage,
@@ -302,6 +306,84 @@ sources.get('/:id/summary', async (c) => {
     return apiError(c, 'NOT_FOUND', 'Summary not yet available')
   }
   return ok(c, { summary: SummarySchema.parse(res.Item['summary']) })
+})
+
+// POST /api/v1/sources/:id/review — files a Source's kept ExtractedItems into a Context (D-137
+// wizard steps 1-2). Non-kept items are marked `discarded`, not deleted — full item history stays
+// queryable for chat/ledger generation later (D-136 reads across a Context's item history, not
+// just the kept subset).
+sources.post('/:id/review', requirePermission('sources:update'), async (c) => {
+  const orgId = c.get('orgId')
+  const id = c.req.param('id')
+  const body = await c.req.json()
+  const parsed = ReviewApprovalRequestSchema.safeParse(body)
+  if (!parsed.success) {
+    return apiError(c, 'BAD_REQUEST', 'Invalid request body', parsed.error.flatten())
+  }
+
+  const sourceRes = await dynamo.send(new GetCommand({
+    TableName: config.dynamo.sourcesTable,
+    Key: { orgId, sourceId: id },
+  }))
+  if (!sourceRes.Item) {
+    return apiError(c, 'NOT_FOUND', 'Source not found')
+  }
+
+  const contextRes = await dynamo.send(new GetCommand({
+    TableName: config.dynamo.contextsTable,
+    Key: { contextId: parsed.data.contextId },
+  }))
+  if (!contextRes.Item || !(await canAccessContext(c, ContextSchema.parse(contextRes.Item)))) {
+    return apiError(c, 'BAD_REQUEST', 'Context not found or not visible to you')
+  }
+
+  const itemsRes = await dynamo.send(new QueryCommand({
+    TableName: config.dynamo.extractedItemsTable,
+    KeyConditionExpression: 'sourceId = :sourceId',
+    ExpressionAttributeValues: { ':sourceId': id },
+  }))
+  const items = (itemsRes.Items ?? []).map((i) => ExtractedItemSchema.parse(i))
+  const keptIds = new Set(parsed.data.kept)
+
+  const now = new Date().toISOString()
+  await Promise.all(items.map((item) => {
+    const kept = keptIds.has(item.itemId)
+    return dynamo.send(new UpdateCommand({
+      TableName: config.dynamo.extractedItemsTable,
+      Key: { sourceId: item.sourceId, itemId: item.itemId },
+      UpdateExpression: kept
+        ? 'SET #status = :status, contextId = :contextId'
+        : 'SET #status = :status',
+      ExpressionAttributeNames: { '#status': 'status' },
+      ExpressionAttributeValues: kept
+        ? { ':status': 'kept', ':contextId': parsed.data.contextId }
+        : { ':status': 'discarded' },
+    }))
+  }))
+
+  await dynamo.send(new UpdateCommand({
+    TableName: config.dynamo.sourcesTable,
+    Key: { orgId, sourceId: id },
+    ConditionExpression: 'attribute_exists(sourceId)',
+    UpdateExpression: 'SET classification = :classification, updatedAt = :now',
+    ExpressionAttributeValues: { ':classification': 'approved', ':now': now },
+  }))
+
+  const keptCount = items.filter((i) => keptIds.has(i.itemId)).length
+  const discardedCount = items.length - keptCount
+  logger.info('Source review approved', {
+    requestId: c.get('requestId'),
+    sourceId: id,
+    contextId: parsed.data.contextId,
+    keptCount,
+    discardedCount,
+  })
+  await auditWriter(c)({
+    resourceType: 'extractedItemReview',
+    action: 'source:review',
+    after: { sourceId: id, contextId: parsed.data.contextId, keptCount, discardedCount },
+  })
+  return ok(c, { keptCount, discardedCount })
 })
 
 export { sources as sourcesRouter }
