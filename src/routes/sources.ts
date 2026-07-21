@@ -11,14 +11,18 @@ import { requirePermission } from '../middleware/rbac.js'
 import { config } from '../config.js'
 import type { AuthContext } from '../middleware/auth.js'
 import type { RequestIdContext } from '../middleware/request-id.js'
+import { canAccessContext } from './contexts.js'
 import {
   SourceSchema,
   JobSchema,
   SummarySchema,
+  ContextSchema,
+  ExtractedItemSchema,
   CreateSourceRequestSchema,
   UpdateSourceRequestSchema,
   EnqueueJobRequestSchema,
   PresignUploadRequestSchema,
+  ReviewApprovalRequestSchema,
   createLogger,
   type Source,
   type TranscriptionJobMessage,
@@ -39,9 +43,12 @@ function isAwsError(err: unknown): err is { name: string } {
 // Audit entries are human-readable and self-contained (D-102), so a source mutation needs the
 // owner's email even though the actor (who may have org-wide sources:update/delete) can differ
 // from the source's userId — resolved via the users table rather than assumed to be the caller.
+// Falls back to a synthetic but valid-format address (never the literal 'unknown') for an owner
+// row that's missing (e.g. a deleted account) — @heediq/shared's audit payload requires
+// z.string().email(), so an invalid fallback would 500 the mutation instead of just the audit note.
 async function resolveOwnerEmail(userId: string): Promise<string> {
   const res = await dynamo.send(new GetCommand({ TableName: config.dynamo.usersTable, Key: { userId } }))
-  return (res.Item?.['email'] as string) ?? 'unknown'
+  return (res.Item?.['email'] as string) ?? `unknown-user+${userId}@heediq.internal`
 }
 
 // GET /api/v1/sources — list org sources, cursor-paginated
@@ -302,6 +309,84 @@ sources.get('/:id/summary', async (c) => {
     return apiError(c, 'NOT_FOUND', 'Summary not yet available')
   }
   return ok(c, { summary: SummarySchema.parse(res.Item['summary']) })
+})
+
+// POST /api/v1/sources/:id/review — files a Source's kept ExtractedItems into a Context (D-137
+// wizard steps 1-2). Non-kept items are marked `discarded`, not deleted — full item history stays
+// queryable for chat/ledger generation later (D-136 reads across a Context's item history, not
+// just the kept subset).
+sources.post('/:id/review', requirePermission('sources:update'), async (c) => {
+  const orgId = c.get('orgId')
+  const id = c.req.param('id')
+  const body = await c.req.json()
+  const parsed = ReviewApprovalRequestSchema.safeParse(body)
+  if (!parsed.success) {
+    return apiError(c, 'BAD_REQUEST', 'Invalid request body', parsed.error.flatten())
+  }
+
+  const sourceRes = await dynamo.send(new GetCommand({
+    TableName: config.dynamo.sourcesTable,
+    Key: { orgId, sourceId: id },
+  }))
+  if (!sourceRes.Item) {
+    return apiError(c, 'NOT_FOUND', 'Source not found')
+  }
+
+  const contextRes = await dynamo.send(new GetCommand({
+    TableName: config.dynamo.contextsTable,
+    Key: { contextId: parsed.data.contextId },
+  }))
+  if (!contextRes.Item || !(await canAccessContext(c, ContextSchema.parse(contextRes.Item)))) {
+    return apiError(c, 'BAD_REQUEST', 'Context not found or not visible to you')
+  }
+
+  const itemsRes = await dynamo.send(new QueryCommand({
+    TableName: config.dynamo.extractedItemsTable,
+    KeyConditionExpression: 'sourceId = :sourceId',
+    ExpressionAttributeValues: { ':sourceId': id },
+  }))
+  const items = (itemsRes.Items ?? []).map((i) => ExtractedItemSchema.parse(i))
+  const keptIds = new Set(parsed.data.kept)
+
+  const now = new Date().toISOString()
+  await Promise.all(items.map((item) => {
+    const kept = keptIds.has(item.itemId)
+    return dynamo.send(new UpdateCommand({
+      TableName: config.dynamo.extractedItemsTable,
+      Key: { sourceId: item.sourceId, itemId: item.itemId },
+      UpdateExpression: kept
+        ? 'SET #status = :status, contextId = :contextId'
+        : 'SET #status = :status',
+      ExpressionAttributeNames: { '#status': 'status' },
+      ExpressionAttributeValues: kept
+        ? { ':status': 'kept', ':contextId': parsed.data.contextId }
+        : { ':status': 'discarded' },
+    }))
+  }))
+
+  await dynamo.send(new UpdateCommand({
+    TableName: config.dynamo.sourcesTable,
+    Key: { orgId, sourceId: id },
+    ConditionExpression: 'attribute_exists(sourceId)',
+    UpdateExpression: 'SET classification = :classification, updatedAt = :now',
+    ExpressionAttributeValues: { ':classification': 'approved', ':now': now },
+  }))
+
+  const keptCount = items.filter((i) => keptIds.has(i.itemId)).length
+  const discardedCount = items.length - keptCount
+  logger.info('Source review approved', {
+    requestId: c.get('requestId'),
+    sourceId: id,
+    contextId: parsed.data.contextId,
+    keptCount,
+    discardedCount,
+  })
+  await auditWriter(c)({
+    resourceType: 'extractedItemReview',
+    action: 'source:review',
+    after: { sourceId: id, contextId: parsed.data.contextId, keptCount, discardedCount },
+  })
+  return ok(c, { keptCount, discardedCount })
 })
 
 export { sources as sourcesRouter }

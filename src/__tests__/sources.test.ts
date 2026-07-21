@@ -15,6 +15,10 @@ vi.mock('../config.js', () => ({
       usersTable: 'heediq-users',
       jobsTable: 'heediq-jobs',
       wsConnectionsTable: 'heediq-ws-connections',
+      contextsTable: 'heediq-contexts',
+      extractedItemsTable: 'heediq-extracted-items',
+      roleAssignmentsTable: 'heediq-role-assignments',
+      auditLogTable: 'heediq-audit-log',
     },
     s3: { audioBucket: 'heediq-audio', presignedUrlExpiresIn: 900 },
     sqs: { transcriptionQueueUrl: 'https://sqs/transcription', summarizationQueueUrl: 'https://sqs/summarization' },
@@ -476,5 +480,95 @@ describe('DELETE /:id — org isolation', () => {
   it('returns 403 without sources:delete permission (D-107)', async () => {
     const res = await makeApp('member', []).request(`/${uuid}`, { method: 'DELETE' })
     expect(res.status).toBe(403)
+  })
+})
+
+const reviewContextId = '00000000-0000-0000-0000-000000000050'
+const keptItemId = '00000000-0000-0000-0000-000000000060'
+const discardedItemId = '00000000-0000-0000-0000-000000000061'
+
+const reviewableContext = {
+  contextId: reviewContextId, orgId, userId, domain: 'work' as const, name: 'Ctx',
+  visibility: 'personal' as const, status: 'active' as const, createdAt: now, updatedAt: now,
+}
+
+const extractedItems = [
+  { itemId: keptItemId, sourceId: uuid, orgId, category: 'decision', text: 'Kept item', confidence: 0.9, status: 'proposed' as const, createdAt: now },
+  { itemId: discardedItemId, sourceId: uuid, orgId, category: 'decision', text: 'Discarded item', confidence: 0.5, status: 'proposed' as const, createdAt: now },
+]
+
+describe('POST /:id/review', () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  it('rejects an invalid body', async () => {
+    const res = await makeApp().request(`/${uuid}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })
+    expect(res.status).toBe(400)
+  })
+
+  it('returns 403 without sources:update permission', async () => {
+    const res = await makeApp('member', []).request(`/${uuid}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contextId: reviewContextId, kept: [keptItemId] }),
+    })
+    expect(res.status).toBe(403)
+  })
+
+  it('returns 404 when the source does not exist', async () => {
+    mockDynamoSend.mockResolvedValueOnce({}) // GetCommand — source
+    const res = await makeApp().request(`/${uuid}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contextId: reviewContextId, kept: [keptItemId] }),
+    })
+    expect(res.status).toBe(404)
+  })
+
+  it('returns 400 when the context does not exist or is not visible to the caller', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Item: existingSource }) // GetCommand — source
+    mockDynamoSend.mockResolvedValueOnce({}) // GetCommand — context, no Item
+    const res = await makeApp().request(`/${uuid}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contextId: reviewContextId, kept: [keptItemId] }),
+    })
+    expect(res.status).toBe(400)
+  })
+
+  it('marks kept items kept+filed and non-kept items discarded, sets Source classification, and audits after-only', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Item: existingSource }) // GetCommand — source
+    mockDynamoSend.mockResolvedValueOnce({ Item: reviewableContext }) // GetCommand — context
+    mockDynamoSend.mockResolvedValueOnce({ Items: extractedItems }) // QueryCommand — extracted items
+    mockDynamoSend.mockResolvedValueOnce({}) // UpdateCommand — kept item
+    mockDynamoSend.mockResolvedValueOnce({}) // UpdateCommand — discarded item
+    mockDynamoSend.mockResolvedValueOnce({}) // UpdateCommand — source classification
+    mockDynamoSend.mockResolvedValueOnce({}) // audit PutCommand
+
+    const res = await makeApp().request(`/${uuid}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contextId: reviewContextId, kept: [keptItemId] }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { data: { keptCount: number; discardedCount: number } }
+    expect(body.data.keptCount).toBe(1)
+    expect(body.data.discardedCount).toBe(1)
+    expect(mockDynamoSend).toHaveBeenCalledTimes(7)
+    expect(mockDynamoSend).toHaveBeenNthCalledWith(7,
+      expect.objectContaining({
+        input: expect.objectContaining({
+          Item: expect.objectContaining({
+            resourceType: 'extractedItemReview',
+            action: 'source:review',
+            after: expect.objectContaining({ sourceId: uuid, contextId: reviewContextId, keptCount: 1, discardedCount: 1 }),
+            before: undefined,
+          }),
+        }),
+      }),
+    )
   })
 })

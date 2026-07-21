@@ -30,14 +30,18 @@ function makeApp(role: 'admin' | 'member' = 'admin') {
   return app
 }
 
-async function seedEntry(overrides: { sk?: string; action?: string; resourceType?: string } = {}) {
+// sk must always be derived from this same entry's timestamp — the route orders/pages by sk
+// (ScanIndexForward: false), so a seed whose sk disagrees with its own timestamp field breaks the
+// sk-order == timestamp-order invariant the route relies on, once any other row shares this org
+// (e.g. requirePermission's D-114 denial-audit write from an earlier test in this file).
+async function seedEntry(overrides: { timestamp?: string; action?: string; resourceType?: string } = {}) {
   const eventId = randomUUID()
-  const timestamp = new Date().toISOString()
+  const timestamp = overrides.timestamp ?? new Date().toISOString()
   await dynamo.send(new PutCommand({
     TableName: AUDIT_LOG_TABLE,
     Item: {
       pk: `ORG#${orgId}`,
-      sk: overrides.sk ?? `${timestamp}#${eventId}`,
+      sk: `${timestamp}#${eventId}`,
       orgId,
       eventId,
       timestamp,
@@ -58,8 +62,8 @@ describe('GET /org/audit-log (integration, DynamoDB Local)', () => {
   })
 
   it('lists entries scoped to the caller org, most recent first', async () => {
-    await seedEntry({ sk: `2026-01-01T00:00:00.000Z#${randomUUID()}` })
-    await seedEntry({ sk: `2026-01-02T00:00:00.000Z#${randomUUID()}` })
+    await seedEntry({ timestamp: '2026-01-01T00:00:00.000Z' })
+    await seedEntry({ timestamp: '2026-01-02T00:00:00.000Z' })
 
     const res = await makeApp('admin').request('/')
     expect(res.status).toBe(200)
@@ -97,7 +101,7 @@ describe('GET /org/audit-log (integration, DynamoDB Local)', () => {
   it('round-trips the cursor against a real LastEvaluatedKey', async () => {
     const pageOrgApp = makeApp('admin')
     for (let i = 0; i < 3; i++) {
-      await seedEntry({ sk: `2026-02-0${i + 1}T00:00:00.000Z#${randomUUID()}` })
+      await seedEntry({ timestamp: `2026-02-0${i + 1}T00:00:00.000Z` })
     }
 
     const res = await pageOrgApp.request('/?limit=1&from=2026-02-01T00:00:00.000Z&to=2026-02-03T23:59:59.999Z')
