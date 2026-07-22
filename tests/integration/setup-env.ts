@@ -29,6 +29,9 @@ const placeholders: Record<string, string> = {
   CONTEXTS_TABLE_NAME: 'heediq-contexts',
   EXTRACTED_ITEMS_TABLE_NAME: 'heediq-extracted-items',
   CONTEXT_GRANTS_TABLE_NAME: 'heediq-context-grants',
+  CONVERSATIONS_TABLE_NAME: 'heediq-conversations',
+  CHAT_MESSAGES_TABLE_NAME: 'heediq-chat-messages',
+  CHAT_QUEUE_URL: 'http://localhost/local-chat-queue',
 }
 
 for (const [key, value] of Object.entries(placeholders)) {
