@@ -26,6 +26,7 @@ All Heediq REST endpoints in a single Lambda function. Handles auth, Source CRUD
 - `src/routes/sources.ts` — Source CRUD + job enqueue + summary fetch (D-068) + `POST /:id/review` (D-143/D-144): files approved extracted items into a Context
 - `src/routes/contexts.ts` — Context Library CRUD + tree (D-143/D-144): list/tree/create/get/patch/delete over `heediq-contexts`, keyed by the `by-scope` GSI (`scopeKey` = `U#<userId>`\|`G#<groupId>`\|`O#<orgId>`, `SK = domainCreatedAt`). `canAccessContext(c, item, minAccess?)` is the shared visibility gate (personal = owner-only, group = live-membership-checked against `heediq-role-assignments`, org = any org member); when the caller fails every same-org/visibility check and `minAccess` (`'read'`\|`'contribute'`) is passed, it falls through to `hasActiveGrant()` — a live `heediq-context-grants` lookup (D-142). PATCH/DELETE never pass `minAccess`, so a cross-org grant can never authorize mutating the Context entity itself; only `GET /:id` (at `'read'`) and `sources.ts`'s review route (at `'contribute'`) opt in. Also imported by `context-grants.ts` to gate grant issuance/listing against the target context.
 - `src/routes/context-grants.ts` — Cross-org Context grant issuance/revoke (D-142): `POST /api/v1/context-grants?contextId=` resolves `granteeEmail` to an existing account via `heediq-users`' `by-email` GSI (existing-accounts-only — no invite flow yet) and writes a `heediq-context-grants` row; `GET /api/v1/context-grants?contextId=` lists grants on a Context the caller can see (owner-side view, via the `by-context` GSI); `GET /api/v1/context-grants/shared-with-me` lists the caller's own live (non-expired) grants across every owner org; `DELETE /api/v1/context-grants/:contextId/:granteeUserId` hard-deletes the row — there is no `status`/`revokedAt`, the audited `DELETE` action is the historical record. All routes but `shared-with-me` are gated by `requirePermission('context:share')` (admin/owner-only, D-141).
+- `src/routes/conversations.ts` — Context chat (D-138/D-139): `POST /api/v1/conversations?contextId=` starts a thread on a Context; `GET /api/v1/conversations?contextId=` lists a Context's threads most-recently-active-first (`heediq-conversations`' `by-context` GSI); `GET /api/v1/conversations/:id/messages` returns the full turn history chronologically (`heediq-chat-messages`, PK=`conversationId`, no GSI needed); `POST /api/v1/conversations/:id/messages` persists the user's turn, bumps the parent conversation's `updatedAt`, resolves the org's tier (`resolveTier()`, same `heediq-orgs`-`plan` lookup `sources.ts` uses for job enqueue, D-067), and enqueues a `ChatJobMessage` directly onto the chat SQS queue for `heediq-chat` to consume. Every route re-fetches the parent Context and gates through `contexts.ts`'s `canAccessContext()`: starting a conversation or posting a message is treated as a `'contribute'`-tier use (drives a Claude turn against the Context's memory, not a passive read), while listing conversations or viewing message history only needs `'read'` — so a `'read'`-only cross-org grant (D-142) can view a shared thread but never start one or post into it. All four routes are gated by `requirePermission('context:read')` at the router level, with `canAccessContext`'s per-instance check doing the real narrowing. The audited `chatMessage:create` payload is ids/role only (`{ conversationId, messageId, role }`) — message `content` is never logged or audited (D-093).
 - `src/routes/upload.ts` — `POST /api/v1/upload/presign` (S3 presigned URL)
 - `src/routes/auth.ts` — unauthenticated `/api/v1/auth` sub-app: `lookup-email` + D-087/D-089 cross-provider linking (`link/request-otp`, `link/verify-otp`, `link/confirm`)
 - `src/lib/cognito.ts` — Cognito Identity Provider SDK wrapper (`SignUp`, `ConfirmSignUp`, `ResendConfirmationCode`, `AdminSetUserPassword`, `AdminLinkProviderForUser`, `AdminDeleteUser`, `AdminCreateUser`, `ListUsers`) used by `routes/auth.ts` and the trigger handlers below
@@ -62,6 +63,7 @@ Client  →  API Gateway HTTP API  →  Lambda (Hono)
  /sources/:id/review  →  canAccessContext('contribute') gate + DynamoDB (extracted-items + contexts + context-grants tables)
             /contexts  →  DynamoDB (contexts table, by-scope GSI) + canAccessContext gate (GET /:id also checks context-grants)
        /context-grants  →  DynamoDB (context-grants table, by-context GSI) + canAccessContext gate + by-email GSI (heediq-users)
+         /conversations  →  canAccessContext gate (via parent context) + DynamoDB (conversations table, by-context GSI; chat-messages table) + SQS (chat queue)
    /upload/presign  →  S3 presigned PUT URL (client uploads directly to S3)
 ```
 
@@ -94,6 +96,11 @@ POST   /api/v1/context-grants?contextId=<id>   { granteeEmail, access: 'read'|'c
 GET    /api/v1/context-grants?contextId=<id>                                                  -> { grants }  (D-142, requires context:share)
 GET    /api/v1/context-grants/shared-with-me                                                  -> { grants }  (D-142, authenticated only — caller's own grants)
 DELETE /api/v1/context-grants/:contextId/:granteeUserId                                       -> { revoked: true }  (D-142, requires context:share)
+
+POST   /api/v1/conversations?contextId=<id>    { title }                          -> { conversation }  (D-138/D-139, requires context:read + contribute-tier canAccessContext)
+GET    /api/v1/conversations?contextId=<id>                                       -> { conversations }  (D-138, requires context:read; most-recently-active first)
+GET    /api/v1/conversations/:id/messages                                         -> { messages }        (D-138, requires context:read; chronological)
+POST   /api/v1/conversations/:id/messages      { content }                        -> { message }         (D-138/D-139, requires context:read + contribute-tier canAccessContext; enqueues chat job)
 
 POST   /api/v1/auth/lookup-email      { email } -> { exists, passwordSet }              (unauthenticated)
 POST   /api/v1/auth/link/request-otp  { email }  -> { sent: true }                       (unauthenticated, D-087)
@@ -209,6 +216,17 @@ independently rejects an expired-but-not-yet-swept row rather than trusting its 
 `requirePermission('context:share')`, which is deliberately withheld from the default `member` seed
 role (admin/owner-only, D-141) — see `@heediq/shared`'s `permissions.ts`.
 
+**D-138/D-139 Context chat (`conversations.ts`):** `heediq-conversations` (PK=`conversationId`,
+`by-context` GSI: PK=`contextId`/SK=`updatedAt`, for most-recently-active-first listing) and
+`heediq-chat-messages` (PK=`conversationId`, SK=`sk` = `<ISO timestamp>#<messageId>`, chronological
+by construction — no GSI needed since messages are always queried by `conversationId`). Posting a
+message resolves the org's tier via the same `heediq-orgs`.`plan` lookup `sources.ts` uses for job
+enqueue (D-067) and enqueues a `ChatJobMessage` straight onto the chat SQS queue (no
+`MessageAttributes` — unlike transcription's EventBridge-Pipes tier-routing attribute, D-139's
+worker reads the tier off the message body itself); `heediq-chat` (a separate worker repo) consumes
+it and streams the assistant's reply over the WS framework. Only the user's turn is persisted and
+enqueued here — the assistant's reply is written by `heediq-chat`, not this API.
+
 **Response envelope:** `{ ok: true, data: T }` | `{ ok: false, error: { code, message, details? } }`
 
 **API version prefix (D-088):** `/api/v1/` is written in exactly one place — the two `app.route()`
@@ -219,30 +237,32 @@ new router follows the same pattern — mount it in `app.ts`, don't hardcode the
 ## Dependencies
 
 - Upstream: `heediq-infra` (Lambda + API Gateway + DynamoDB + S3 + SQS must exist before deploy, D-050)
-- Upstream: `@heediq/shared` (Zod schemas + types, D-033) — pinned to `^0.15.2` (D-085/D-093 `createLogger` structured logger, mandatory per D-093; `passwordPolicy.ts`'s `isPasswordPolicyCompliant` is consumed in `routes/auth.ts`'s `/link/confirm`, D-094; D-102 adds the 5 RBAC request schemas and `buildAuditLogEntry()`, consumed by `routes/roles.ts`/`groups.ts`/`role-assignments.ts` and `lib/audit.ts`; D-114 adds `audit.ts`'s `effect` field and `permission` resourceType, consumed by `middleware/rbac.ts`; D-143/D-144 adds `Create/UpdateContextRequestSchema`, `ReviewApprovalRequestSchema`, `ExtractedItemSchema`, and the `context`/`extractedItemReview` `AuditPayloadMap` entries, consumed by `routes/contexts.ts` and the review route in `routes/sources.ts`; D-142 (0.15.2) fixes `ContextGrantSchema.expiresAt` to epoch-seconds and adds `CreateContextGrantRequestSchema` + the `contextGrant` `AuditPayloadMap` entry, consumed by `routes/context-grants.ts`)
-- Upstream: `heediq-infra`'s `heediq-contexts`/`heediq-extracted-items`/`heediq-context-grants` tables + GSIs (D-143/D-144/D-142, ApiStack IAM grants + env vars)
+- Upstream: `@heediq/shared` (Zod schemas + types, D-033) — pinned to `^0.15.3` (D-085/D-093 `createLogger` structured logger, mandatory per D-093; `passwordPolicy.ts`'s `isPasswordPolicyCompliant` is consumed in `routes/auth.ts`'s `/link/confirm`, D-094; D-102 adds the 5 RBAC request schemas and `buildAuditLogEntry()`, consumed by `routes/roles.ts`/`groups.ts`/`role-assignments.ts` and `lib/audit.ts`; D-114 adds `audit.ts`'s `effect` field and `permission` resourceType, consumed by `middleware/rbac.ts`; D-143/D-144 adds `Create/UpdateContextRequestSchema`, `ReviewApprovalRequestSchema`, `ExtractedItemSchema`, and the `context`/`extractedItemReview` `AuditPayloadMap` entries, consumed by `routes/contexts.ts` and the review route in `routes/sources.ts`; D-142 (0.15.2) fixes `ContextGrantSchema.expiresAt` to epoch-seconds and adds `CreateContextGrantRequestSchema` + the `contextGrant` `AuditPayloadMap` entry, consumed by `routes/context-grants.ts`; D-138/D-139 (0.15.3) adds `ConversationSchema`, `ChatMessageSchema`, `CreateConversationRequestSchema`, `CreateMessageRequestSchema`, `ChatJobMessage`, and the `conversation`/`chatMessage` `AuditPayloadMap` entries, consumed by `routes/conversations.ts`)
+- Upstream: `heediq-infra`'s `heediq-contexts`/`heediq-extracted-items`/`heediq-context-grants`/`heediq-conversations`/`heediq-chat-messages` tables + GSIs (D-143/D-144/D-142/D-138, ApiStack IAM grants + env vars) and the chat SQS queue (D-139, `CHAT_QUEUE_URL`)
 - Downstream: `heediq-worker-transcription` (reads SQS messages enqueued here). `config.ts` also reads `SUMMARIZATION_QUEUE_URL`, but no route currently sends to it — the text-upload → summarization-queue direct path isn't wired up yet.
-- Shared surfaces: `heediq-sources`, `heediq-jobs`, `heediq-contexts`, `heediq-extracted-items`, `heediq-context-grants` DynamoDB tables
+- Downstream: `heediq-chat` (consumes `ChatJobMessage`s enqueued by `routes/conversations.ts` onto the chat SQS queue, D-139)
+- Shared surfaces: `heediq-sources`, `heediq-jobs`, `heediq-contexts`, `heediq-extracted-items`, `heediq-context-grants`, `heediq-conversations`, `heediq-chat-messages` DynamoDB tables
 - Upstream (auth): `heediq-infra`'s `UserAuthMethodsTable`/`AuthAuditLogTable` (D-087) and the Cognito User Pool triggers wired to the 3 `auth-trigger-*.ts` handlers — see `heediq-infra/README.md`
 - Upstream (auth): `heediq-infra`'s `heediq-rate-limits` table (D-097) backing `src/lib/rateLimit.ts`
 
 ## Testing
 
 ```bash
-pnpm run test          # 243 unit tests (auth routes + auth methods + settings link + auth triggers + sources + contexts (incl. cross-org grant access) + app routing + rate limiting + roles + groups + role-assignments + rbac + rbac-middleware + me + users + wsPush + ws-connect + ws-pusher + classification-pusher)
+pnpm run test          # 260 unit tests (auth routes + auth methods + settings link + auth triggers + sources + contexts (incl. cross-org grant access) + context-grants + conversations (D-138/D-139 chat) + app routing + rate limiting + roles + groups + role-assignments + rbac + rbac-middleware + me + users + wsPush + ws-connect + ws-pusher + classification-pusher)
 pnpm run typecheck     # tsc --noEmit
 pnpm run test:pre-pr   # typecheck + test (run before opening a PR)
 pnpm run dev           # local dev server on :3000 (tsx watch)
 ```
 
 `pnpm run dev` calls `requireEnv()` in `config.ts` at cold start and crashes immediately if any of
-these 22 vars are unset — all real AWS resources deployed by `heediq-infra`, no local fakes:
+these 25 vars are unset — all real AWS resources deployed by `heediq-infra`, no local fakes:
 `COGNITO_USER_POOL_ID`, `COGNITO_CLIENT_ID`, `SOURCES_TABLE_NAME`, `ORGS_TABLE_NAME`,
 `USERS_TABLE_NAME`, `JOBS_TABLE_NAME`, `WS_CONNECTIONS_TABLE_NAME`, `USER_AUTH_METHODS_TABLE_NAME`,
 `AUTH_AUDIT_LOG_TABLE_NAME`, `RATE_LIMITS_TABLE_NAME`, `COGNITO_IDENTITIES_TABLE_NAME`,
 `AUDIO_BUCKET_NAME`, `TRANSCRIPTION_QUEUE_URL`, `SUMMARIZATION_QUEUE_URL`, `ROLES_TABLE_NAME`,
 `GROUPS_TABLE_NAME`, `ROLE_ASSIGNMENTS_TABLE_NAME`, `AUDIT_LOG_TABLE_NAME`,
 `CONTEXTS_TABLE_NAME`, `EXTRACTED_ITEMS_TABLE_NAME`, `CONTEXT_GRANTS_TABLE_NAME`,
+`CONVERSATIONS_TABLE_NAME`, `CHAT_MESSAGES_TABLE_NAME`, `CHAT_QUEUE_URL`,
 `WS_MANAGEMENT_ENDPOINT` (D-109). Pull the actual values
 from the deployed `dev` account (SSM params / CDK stack outputs, see `heediq-infra/README.md`) into
 a local `.env` and export before running `dev`.
@@ -268,7 +288,11 @@ scoping, update/delete existence checks, D-060 tier gating on job enqueue with
 `@aws-sdk/client-sqs` mocked since SQS is outside DynamoDB Local's scope), and `routes/context-grants.ts`
 (D-142 — grant issuance/listing/revoke, cross-org-only enforcement, `context:share` permission gate,
 a `'read'` grant rejected for a `'contribute'`-tier action, immediate loss of access on revoke, and
-owner-org isolation on revoke). Route-level tests use
+owner-org isolation on revoke), plus `routes/conversations.ts` (D-138/D-139 — create/list a
+conversation, post/list messages, org-plan tier resolution reflected in the enqueued `ChatJobMessage`,
+`@aws-sdk/client-sqs` mocked at the module boundary same as the sources suite, a personal Context
+owned by someone else rejected on conversation creation, and a cross-org caller with no grant
+rejected on posting a message). Route-level tests use
 the same synthetic-auth-middleware pattern as the mocked unit tests (mount the router directly, set
 `userId`/`orgId`/`role`/`permissions` on context), just against the real `dynamo` client.
 `tests/integration/scenarios/rbac-journey.test.ts` chains role → group → assignment →

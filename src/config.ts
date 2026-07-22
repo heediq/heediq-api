@@ -28,13 +28,14 @@ export const config = {
     groupsTable: requireEnv('GROUPS_TABLE_NAME'),
     roleAssignmentsTable: requireEnv('ROLE_ASSIGNMENTS_TABLE_NAME'),
     auditLogTable: requireEnv('AUDIT_LOG_TABLE_NAME'),
-    // Context Library (D-124–D-143) — step 4b's two tables plus context-grants (step 4c-i). The
-    // remaining 3 (decision-ledger/conversations/chat-messages) are granted to this Lambda already
-    // (heediq-infra#61) but stay unconsumed until step 4c's later sub-steps add their routes —
-    // added here only once a route actually reads/writes them, per D-103 scoping.
+    // Context Library (D-124–D-143) — step 4b's two tables plus context-grants (step 4c-i) and now
+    // conversations/chat-messages (step 4c-ii). decision-ledger stays unconsumed until a later
+    // sub-step adds its route — added here only once a route actually reads/writes it, per D-103.
     contextsTable: requireEnv('CONTEXTS_TABLE_NAME'),
     extractedItemsTable: requireEnv('EXTRACTED_ITEMS_TABLE_NAME'),
     contextGrantsTable: requireEnv('CONTEXT_GRANTS_TABLE_NAME'),
+    conversationsTable: requireEnv('CONVERSATIONS_TABLE_NAME'),
+    chatMessagesTable: requireEnv('CHAT_MESSAGES_TABLE_NAME'),
   },
   s3: {
     audioBucket: requireEnv('AUDIO_BUCKET_NAME'),
@@ -43,6 +44,7 @@ export const config = {
   sqs: {
     transcriptionQueueUrl: requireEnv('TRANSCRIPTION_QUEUE_URL'),
     summarizationQueueUrl: requireEnv('SUMMARIZATION_QUEUE_URL'),
+    chatQueueUrl: requireEnv('CHAT_QUEUE_URL'),
   },
   ws: {
     managementEndpoint: requireEnv('WS_MANAGEMENT_ENDPOINT'),
