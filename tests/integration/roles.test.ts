@@ -77,14 +77,19 @@ describe('roles CRUD (integration, DynamoDB Local)', () => {
     const roleId = await seedCustomRole(tables, orgId, ['audit:read'])
     const app = makeApp(orgId, 'admin')
 
+    // Update name AND permissions together — `permissions` is a DynamoDB reserved word, so
+    // this path 500s with a ValidationException unless the UpdateExpression aliases it (#permissions).
     const updateRes = await app.request(`/${roleId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'Renamed Reviewer' }),
+      body: JSON.stringify({ name: 'Renamed Reviewer', permissions: ['audit:read', 'context:read'] }),
     })
     expect(updateRes.status).toBe(200)
-    const updateBody = (await updateRes.json()) as { data: { role: { name: string } } }
+    const updateBody = (await updateRes.json()) as {
+      data: { role: { name: string; permissions: string[] } }
+    }
     expect(updateBody.data.role.name).toBe('Renamed Reviewer')
+    expect(new Set(updateBody.data.role.permissions)).toEqual(new Set(['audit:read', 'context:read']))
 
     const missingRes = await app.request(`/${randomUUID()}`, {
       method: 'PATCH',

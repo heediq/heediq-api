@@ -107,7 +107,9 @@ roles.patch('/:id', requirePermission('org:manage-roles'), async (c) => {
     values[':name'] = parsed.data.name
   }
   if (parsed.data.permissions !== undefined) {
-    updates.push('permissions = :permissions')
+    // `permissions` is a DynamoDB reserved word — must be aliased, same as `name` above.
+    updates.push('#permissions = :permissions')
+    names['#permissions'] = 'permissions'
     values[':permissions'] = parsed.data.permissions
   }
 
