@@ -14,6 +14,13 @@ env:
   AUTH_TRIGGER_PRE_SIGNUP_FUNCTION_NAME: heediq-auth-trigger-pre-signup
   AUTH_TRIGGER_POST_CONFIRMATION_FUNCTION_NAME: heediq-auth-trigger-post-confirmation
   AUTH_TRIGGER_POST_AUTHENTICATION_FUNCTION_NAME: heediq-auth-trigger-post-authentication
+  # WebSocket handlers (D-109). Infra creates these as placeholder shells (WebSocketStack);
+  # their real code ships from this repo — they must deploy here or they stay placeholders
+  # (the pre-2026-07-23 "WS-CD gap"). Handler → function name mapping is in
+  # heediq-infra/lib/websocket/websocket-stack.ts.
+  WS_CONNECT_FUNCTION_NAME: heediq-ws-connect
+  WS_PUSHER_FUNCTION_NAME: heediq-ws-status-pusher
+  WS_CLASSIFICATION_PUSHER_FUNCTION_NAME: heediq-ws-classification-pusher
 
 jobs:
   build:
@@ -63,6 +70,15 @@ jobs:
       - name: Bundle auth-trigger-post-authentication
         run: pnpm run bundle:auth-trigger-post-authentication
 
+      - name: Bundle ws-connect
+        run: pnpm run bundle:ws-connect
+
+      - name: Bundle ws-pusher
+        run: pnpm run bundle:ws-pusher
+
+      - name: Bundle classification-pusher
+        run: pnpm run bundle:classification-pusher
+
       - name: Zip
         run: |
           zip -j dist/lambda.zip dist/index.js
@@ -70,6 +86,9 @@ jobs:
           zip -j dist/auth-trigger-pre-signup.zip dist/auth-trigger-pre-signup.js
           zip -j dist/auth-trigger-post-confirmation.zip dist/auth-trigger-post-confirmation.js
           zip -j dist/auth-trigger-post-authentication.zip dist/auth-trigger-post-authentication.js
+          zip -j dist/ws-connect.zip dist/ws-connect.js
+          zip -j dist/ws-pusher.zip dist/ws-pusher.js
+          zip -j dist/classification-pusher.zip dist/classification-pusher.js
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -81,6 +100,9 @@ jobs:
             dist/auth-trigger-pre-signup.zip
             dist/auth-trigger-post-confirmation.zip
             dist/auth-trigger-post-authentication.zip
+            dist/ws-connect.zip
+            dist/ws-pusher.zip
+            dist/classification-pusher.zip
           retention-days: 1
 
   deploy-dev:
@@ -120,6 +142,15 @@ jobs:
       - name: Deploy auth-trigger-post-authentication Lambda
         run: aws lambda update-function-code --function-name ${{ env.AUTH_TRIGGER_POST_AUTHENTICATION_FUNCTION_NAME }} --zip-file fileb://auth-trigger-post-authentication.zip
 
+      - name: Deploy ws-connect Lambda
+        run: aws lambda update-function-code --function-name ${{ env.WS_CONNECT_FUNCTION_NAME }} --zip-file fileb://ws-connect.zip
+
+      - name: Deploy ws-pusher Lambda
+        run: aws lambda update-function-code --function-name ${{ env.WS_PUSHER_FUNCTION_NAME }} --zip-file fileb://ws-pusher.zip
+
+      - name: Deploy classification-pusher Lambda
+        run: aws lambda update-function-code --function-name ${{ env.WS_CLASSIFICATION_PUSHER_FUNCTION_NAME }} --zip-file fileb://classification-pusher.zip
+
   deploy-staging:
     name: Deploy → staging
     needs: build
@@ -157,6 +188,15 @@ jobs:
       - name: Deploy auth-trigger-post-authentication Lambda
         run: aws lambda update-function-code --function-name ${{ env.AUTH_TRIGGER_POST_AUTHENTICATION_FUNCTION_NAME }} --zip-file fileb://auth-trigger-post-authentication.zip
 
+      - name: Deploy ws-connect Lambda
+        run: aws lambda update-function-code --function-name ${{ env.WS_CONNECT_FUNCTION_NAME }} --zip-file fileb://ws-connect.zip
+
+      - name: Deploy ws-pusher Lambda
+        run: aws lambda update-function-code --function-name ${{ env.WS_PUSHER_FUNCTION_NAME }} --zip-file fileb://ws-pusher.zip
+
+      - name: Deploy classification-pusher Lambda
+        run: aws lambda update-function-code --function-name ${{ env.WS_CLASSIFICATION_PUSHER_FUNCTION_NAME }} --zip-file fileb://classification-pusher.zip
+
   deploy-prod:
     name: Deploy → prod
     needs: deploy-staging
@@ -193,3 +233,12 @@ jobs:
 
       - name: Deploy auth-trigger-post-authentication Lambda
         run: aws lambda update-function-code --function-name ${{ env.AUTH_TRIGGER_POST_AUTHENTICATION_FUNCTION_NAME }} --zip-file fileb://auth-trigger-post-authentication.zip
+
+      - name: Deploy ws-connect Lambda
+        run: aws lambda update-function-code --function-name ${{ env.WS_CONNECT_FUNCTION_NAME }} --zip-file fileb://ws-connect.zip
+
+      - name: Deploy ws-pusher Lambda
+        run: aws lambda update-function-code --function-name ${{ env.WS_PUSHER_FUNCTION_NAME }} --zip-file fileb://ws-pusher.zip
+
+      - name: Deploy classification-pusher Lambda
+        run: aws lambda update-function-code --function-name ${{ env.WS_CLASSIFICATION_PUSHER_FUNCTION_NAME }} --zip-file fileb://classification-pusher.zip
