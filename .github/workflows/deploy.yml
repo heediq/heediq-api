@@ -86,9 +86,12 @@ jobs:
           zip -j dist/auth-trigger-pre-signup.zip dist/auth-trigger-pre-signup.js
           zip -j dist/auth-trigger-post-confirmation.zip dist/auth-trigger-post-confirmation.js
           zip -j dist/auth-trigger-post-authentication.zip dist/auth-trigger-post-authentication.js
-          zip -j dist/ws-connect.zip dist/ws-connect.js
-          zip -j dist/ws-pusher.zip dist/ws-pusher.js
-          zip -j dist/classification-pusher.zip dist/classification-pusher.js
+          # WS handler Lambdas run under handler `index.handler` (WebSocketStack placeholders),
+          # so each zip must contain index.js — stage per-handler into its own dir to avoid
+          # clobbering the API's dist/index.js.
+          for h in ws-connect ws-pusher classification-pusher; do
+            mkdir -p "dist/$h" && cp "dist/$h.js" "dist/$h/index.js" && zip -j "dist/$h.zip" "dist/$h/index.js"
+          done
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
