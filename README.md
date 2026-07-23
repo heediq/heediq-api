@@ -60,6 +60,7 @@ Client  →  API Gateway HTTP API  →  Lambda (Hono)
                  /me  →  DynamoDB (users + orgs tables)
              /sources  →  DynamoDB (sources table) + SQS (transcription queue)
        /sources/:id/jobs  →  D-060 check + DynamoDB (jobs table) + SQS enqueue
+       /sources/:id/items  →  org-keyed source existence gate + DynamoDB (extracted-items table, PK=sourceId)
  /sources/:id/review  →  canAccessContext('contribute') gate + DynamoDB (extracted-items + contexts + context-grants tables)
             /contexts  →  DynamoDB (contexts table, by-scope GSI) + canAccessContext gate (GET /:id also checks context-grants)
        /context-grants  →  DynamoDB (context-grants table, by-context GSI) + canAccessContext gate + by-email GSI (heediq-users)
@@ -82,6 +83,7 @@ PATCH  /api/v1/sources/:id            { title? }
 DELETE /api/v1/sources/:id
 POST   /api/v1/sources/:id/jobs       { sourceId, model: 'small'|'large-v3' }
 GET    /api/v1/sources/:id/summary
+GET    /api/v1/sources/:id/items      -> { items: ExtractedItem[] }  (source detail + review wizard, D-135/D-137)
 POST   /api/v1/sources/:id/review     { contextId, kept: string[] }  -> { keptCount, discardedCount }  (D-143/D-144, requires sources:update)
 POST   /api/v1/upload/presign         { sourceId, contentType, fileSizeBytes }
 

@@ -311,6 +311,29 @@ sources.get('/:id/summary', async (c) => {
   return ok(c, { summary: SummarySchema.parse(res.Item['summary']) })
 })
 
+// GET /api/v1/sources/:id/items — the Source's ExtractedItems, powering source detail and the
+// review wizard (D-135/D-137). Org isolation rides on the org-keyed Source existence check first
+// (ExtractedItems are PK'd by sourceId alone, not orgId), exactly like GET /:id and /:id/summary
+// above — a source in another org 404s before any item is read.
+sources.get('/:id/items', async (c) => {
+  const orgId = c.get('orgId')
+  const id = c.req.param('id')
+  const sourceRes = await dynamo.send(new GetCommand({
+    TableName: config.dynamo.sourcesTable,
+    Key: { orgId, sourceId: id },
+  }))
+  if (!sourceRes.Item) {
+    return apiError(c, 'NOT_FOUND', 'Source not found')
+  }
+  const itemsRes = await dynamo.send(new QueryCommand({
+    TableName: config.dynamo.extractedItemsTable,
+    KeyConditionExpression: 'sourceId = :sourceId',
+    ExpressionAttributeValues: { ':sourceId': id },
+  }))
+  const items = (itemsRes.Items ?? []).map((i) => ExtractedItemSchema.parse(i))
+  return ok(c, { items })
+})
+
 // POST /api/v1/sources/:id/review — files a Source's kept ExtractedItems into a Context (D-137
 // wizard steps 1-2). Non-kept items are marked `discarded`, not deleted — full item history stays
 // queryable for chat/ledger generation later (D-136 reads across a Context's item history, not

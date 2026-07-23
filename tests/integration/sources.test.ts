@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { randomUUID } from 'node:crypto'
 import { Hono } from 'hono'
-import { UpdateCommand } from '@aws-sdk/lib-dynamodb'
+import { UpdateCommand, PutCommand } from '@aws-sdk/lib-dynamodb'
 import { DEFAULT_ORG_RBAC_SEED } from '@heediq/shared'
 import { dynamo } from '../../src/lib/dynamo.js'
 import { config } from '../../src/config.js'
@@ -241,5 +241,63 @@ describe('sources CRUD + pagination (integration, DynamoDB Local)', () => {
       body: JSON.stringify({ sourceId, model: 'small' }),
     })
     expect(res.status).toBe(400)
+  })
+})
+
+describe('GET /:id/items — extracted items (integration, DynamoDB Local)', () => {
+  async function seedItem(sourceId: string, orgId: string, overrides: Partial<{ category: string; itemId: string }> = {}) {
+    const itemId = overrides.itemId ?? randomUUID()
+    await dynamo.send(new PutCommand({
+      TableName: config.dynamo.extractedItemsTable,
+      Item: {
+        itemId,
+        sourceId,
+        orgId,
+        category: overrides.category ?? 'requirements',
+        text: 'Extracted statement',
+        confidence: 0.88,
+        status: 'proposed',
+        createdAt: new Date().toISOString(),
+      },
+    }))
+    return itemId
+  }
+
+  it('returns all extracted items for a source', async () => {
+    const orgId = await seedTestOrg()
+    const app = makeApp(orgId, randomUUID(), 'admin')
+    const sourceId = await createSource(app)
+    await seedItem(sourceId, orgId)
+    await seedItem(sourceId, orgId, { category: 'decisions' })
+
+    const res = await app.request(`/${sourceId}/items`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { items: { sourceId: string; category: string }[] } }
+    expect(body.data.items).toHaveLength(2)
+    expect(new Set(body.data.items.map((i) => i.category))).toEqual(new Set(['requirements', 'decisions']))
+    expect(body.data.items.every((i) => i.sourceId === sourceId)).toBe(true)
+  })
+
+  it('returns an empty list for a source with no items', async () => {
+    const orgId = await seedTestOrg()
+    const app = makeApp(orgId, randomUUID(), 'admin')
+    const sourceId = await createSource(app)
+
+    const res = await app.request(`/${sourceId}/items`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { items: unknown[] } }
+    expect(body.data.items).toEqual([])
+  })
+
+  it('404s across org isolation — another org cannot read a source’s items even by id', async () => {
+    const ownerOrgId = await seedTestOrg()
+    const ownerApp = makeApp(ownerOrgId, randomUUID(), 'admin')
+    const sourceId = await createSource(ownerApp)
+    await seedItem(sourceId, ownerOrgId)
+
+    const otherOrgId = await seedTestOrg()
+    const otherApp = makeApp(otherOrgId, randomUUID(), 'admin')
+    const res = await otherApp.request(`/${sourceId}/items`)
+    expect(res.status).toBe(404)
   })
 })
