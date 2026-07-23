@@ -215,6 +215,52 @@ describe('GET /:id — org isolation', () => {
   })
 })
 
+describe('GET /:id/items — extracted items', () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  const item = {
+    itemId: '00000000-0000-0000-0000-000000000010',
+    sourceId: uuid,
+    orgId,
+    category: 'requirements',
+    text: 'The export must be CSV',
+    confidence: 0.9,
+    status: 'proposed' as const,
+    createdAt: now,
+  }
+
+  it('returns the source’s extracted items', async () => {
+    mockDynamoSend
+      .mockResolvedValueOnce({ Item: { sourceId: uuid, orgId, userId, title: 'T', status: 'ready', labels: [], createdAt: now, updatedAt: now } }) // source Get
+      .mockResolvedValueOnce({ Items: [item] }) // items Query
+    const res = await makeApp().request(`/${uuid}/items`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { items: { itemId: string }[] } }
+    expect(body.data.items).toHaveLength(1)
+    expect(body.data.items[0]!.itemId).toBe(item.itemId)
+  })
+
+  it('gates on the org-keyed source first, then queries items by sourceId', async () => {
+    mockDynamoSend
+      .mockResolvedValueOnce({ Item: { sourceId: uuid, orgId, userId, title: 'T', status: 'ready', labels: [], createdAt: now, updatedAt: now } })
+      .mockResolvedValueOnce({ Items: [] })
+    await makeApp().request(`/${uuid}/items`)
+    expect(mockDynamoSend).toHaveBeenNthCalledWith(1,
+      expect.objectContaining({ input: expect.objectContaining({ Key: { orgId, sourceId: uuid } }) }),
+    )
+    expect(mockDynamoSend).toHaveBeenNthCalledWith(2,
+      expect.objectContaining({ input: expect.objectContaining({ ExpressionAttributeValues: { ':sourceId': uuid } }) }),
+    )
+  })
+
+  it('404s for a source in another org without ever reading items', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Item: undefined }) // source Get misses
+    const res = await makeApp().request(`/${uuid}/items`)
+    expect(res.status).toBe(404)
+    expect(mockDynamoSend).toHaveBeenCalledTimes(1) // no item Query on a 404
+  })
+})
+
 describe('POST /:id/jobs — D-060 access control', () => {
   beforeEach(() => vi.clearAllMocks())
 
