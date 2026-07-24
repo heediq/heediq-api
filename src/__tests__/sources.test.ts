@@ -21,7 +21,7 @@ vi.mock('../config.js', () => ({
       auditLogTable: 'heediq-audit-log',
     },
     s3: { audioBucket: 'heediq-audio', presignedUrlExpiresIn: 900 },
-    sqs: { transcriptionQueueUrl: 'https://sqs/transcription', summarizationQueueUrl: 'https://sqs/summarization' },
+    sqs: { transcriptionQueueUrl: 'https://sqs/transcription', summarizationQueueUrl: 'https://sqs/summarization', ledgerQueueUrl: 'https://sqs/ledger' },
     cors: { origins: [] },
   },
 }))
@@ -593,6 +593,8 @@ describe('POST /:id/review', () => {
     mockDynamoSend.mockResolvedValueOnce({}) // UpdateCommand — discarded item
     mockDynamoSend.mockResolvedValueOnce({}) // UpdateCommand — source classification
     mockDynamoSend.mockResolvedValueOnce({}) // audit PutCommand
+    mockDynamoSend.mockResolvedValueOnce({ Item: { orgId, plan: 'paid' } }) // GetCommand — org plan (ledger tier)
+    mockSqsSend.mockResolvedValueOnce({})
 
     const res = await makeApp().request(`/${uuid}/review`, {
       method: 'POST',
@@ -603,7 +605,7 @@ describe('POST /:id/review', () => {
     const body = await res.json() as { data: { keptCount: number; discardedCount: number } }
     expect(body.data.keptCount).toBe(1)
     expect(body.data.discardedCount).toBe(1)
-    expect(mockDynamoSend).toHaveBeenCalledTimes(7)
+    expect(mockDynamoSend).toHaveBeenCalledTimes(8)
     expect(mockDynamoSend).toHaveBeenNthCalledWith(7,
       expect.objectContaining({
         input: expect.objectContaining({
@@ -616,5 +618,50 @@ describe('POST /:id/review', () => {
         }),
       }),
     )
+    // D-148: a ledger reconciliation job is enqueued for the filed items.
+    expect(mockSqsSend).toHaveBeenCalledOnce()
+    const job = JSON.parse(mockSqsSend.mock.calls[0][0].MessageBody)
+    expect(mockSqsSend.mock.calls[0][0].QueueUrl).toBe('https://sqs/ledger')
+    expect(job).toMatchObject({ contextId: reviewContextId, sourceId: uuid, orgId, tier: 'paid' })
+  })
+
+  it('does not enqueue a ledger job when nothing was kept (D-148)', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Item: existingSource }) // source
+    mockDynamoSend.mockResolvedValueOnce({ Item: reviewableContext }) // context
+    mockDynamoSend.mockResolvedValueOnce({ Items: extractedItems }) // items
+    mockDynamoSend.mockResolvedValueOnce({}) // discard item 1
+    mockDynamoSend.mockResolvedValueOnce({}) // discard item 2
+    mockDynamoSend.mockResolvedValueOnce({}) // source classification
+    mockDynamoSend.mockResolvedValueOnce({}) // audit
+
+    const res = await makeApp().request(`/${uuid}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contextId: reviewContextId, kept: [] }),
+    })
+    expect(res.status).toBe(200)
+    expect(mockSqsSend).not.toHaveBeenCalled()
+    expect(mockDynamoSend).toHaveBeenCalledTimes(7) // no org-plan lookup either
+  })
+
+  it('still returns 200 when the ledger enqueue fails — review is already committed (D-148 best-effort)', async () => {
+    mockDynamoSend.mockResolvedValueOnce({ Item: existingSource }) // source
+    mockDynamoSend.mockResolvedValueOnce({ Item: reviewableContext }) // context
+    mockDynamoSend.mockResolvedValueOnce({ Items: extractedItems }) // items
+    mockDynamoSend.mockResolvedValueOnce({}) // kept
+    mockDynamoSend.mockResolvedValueOnce({}) // discarded
+    mockDynamoSend.mockResolvedValueOnce({}) // classification
+    mockDynamoSend.mockResolvedValueOnce({}) // audit
+    mockDynamoSend.mockResolvedValueOnce({ Item: { orgId, plan: 'free' } }) // org plan
+    mockSqsSend.mockRejectedValueOnce(new Error('SQS unavailable'))
+
+    const res = await makeApp().request(`/${uuid}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contextId: reviewContextId, kept: [keptItemId] }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { data: { keptCount: number } }
+    expect(body.data.keptCount).toBe(1)
   })
 })

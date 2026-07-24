@@ -12,6 +12,7 @@ vi.mock('../config.js', () => ({
       contextsTable: 'heediq-contexts',
       conversationsTable: 'heediq-conversations',
       chatMessagesTable: 'heediq-chat-messages',
+      decisionLedgerTable: 'heediq-decision-ledger',
       orgsTable: 'heediq-orgs',
       roleAssignmentsTable: 'heediq-role-assignments',
       contextGrantsTable: 'heediq-context-grants',
@@ -53,6 +54,24 @@ const userId = '00000000-0000-0000-0000-000000000002'
 const otherUserId = '00000000-0000-0000-0000-000000000003'
 const contextId = '00000000-0000-0000-0000-000000000010'
 const conversationId = '00000000-0000-0000-0000-000000000030'
+const entryOpenId = '00000000-0000-0000-0000-000000000040'
+const entryReviewId = '00000000-0000-0000-0000-000000000041'
+
+function ledgerEntry(overrides: Record<string, unknown> = {}) {
+  return {
+    entryId: '00000000-0000-0000-0000-000000000042',
+    contextId,
+    topic: 'A decision',
+    answer: 'settled',
+    status: 'confirmed',
+    confidence: 0.9,
+    origin: 'auto',
+    sourceRefs: [],
+    createdAt: now,
+    updatedAt: now,
+    ...overrides,
+  }
+}
 
 function personalContext(overrides: Record<string, unknown> = {}) {
   return {
@@ -243,6 +262,7 @@ describe('POST /conversations/:id/messages', () => {
     mockDynamoSend
       .mockResolvedValueOnce({ Item: conversation() }) // loadConversation
       .mockResolvedValueOnce({ Item: personalContext() }) // loadContext
+      .mockResolvedValueOnce({ Items: [] }) // D-149 gating query — empty ledger, no block
       .mockResolvedValueOnce({}) // PutCommand message
       .mockResolvedValueOnce({}) // UpdateCommand touch
       .mockResolvedValueOnce({ Item: { orgId, plan: 'paid' } }) // resolveTier
@@ -270,6 +290,7 @@ describe('POST /conversations/:id/messages', () => {
     mockDynamoSend
       .mockResolvedValueOnce({ Item: conversation() })
       .mockResolvedValueOnce({ Item: personalContext() })
+      .mockResolvedValueOnce({ Items: [] }) // D-149 gating query — empty ledger
       .mockResolvedValueOnce({})
       .mockResolvedValueOnce({})
       .mockResolvedValueOnce({}) // resolveTier — no Item
@@ -284,6 +305,51 @@ describe('POST /conversations/:id/messages', () => {
     expect(res.status).toBe(201)
     const job = JSON.parse(mockSqsSend.mock.calls[0][0].MessageBody)
     expect(job.tier).toBe('free')
+  })
+
+  it('gates the turn (LEDGER_GATED) when the context has an unsettled ledger entry (D-149)', async () => {
+    mockDynamoSend
+      .mockResolvedValueOnce({ Item: conversation() }) // loadConversation
+      .mockResolvedValueOnce({ Item: personalContext() }) // loadContext
+      .mockResolvedValueOnce({ Items: [ // D-149 gating query
+        ledgerEntry({ status: 'confirmed' }),
+        ledgerEntry({ entryId: entryOpenId, topic: 'Which DB?', answer: null, status: 'open' }),
+        ledgerEntry({ entryId: entryReviewId, topic: 'Auth provider', status: 'needs_review' }),
+      ] })
+
+    const res = await makeApp().request(`/${conversationId}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'go' }),
+    })
+    expect(res.status).toBe(409)
+    const body = await res.json() as { error: { code: string; details: { blockingEntries: { entryId: string; topic: string; status: string }[] } } }
+    expect(body.error.code).toBe('LEDGER_GATED')
+    expect(body.error.details.blockingEntries).toHaveLength(2)
+    expect(body.error.details.blockingEntries.map((e) => e.status).sort()).toEqual(['needs_review', 'open'])
+    // Nothing persisted or enqueued on a block.
+    expect(mockSqsSend).not.toHaveBeenCalled()
+    expect(mockDynamoSend).toHaveBeenCalledTimes(3)
+  })
+
+  it('bypasses gating when bypassLedgerGating is set, even with unsettled entries (D-149)', async () => {
+    mockDynamoSend
+      .mockResolvedValueOnce({ Item: conversation() }) // loadConversation
+      .mockResolvedValueOnce({ Item: personalContext() }) // loadContext
+      // no gating query — bypass short-circuits it
+      .mockResolvedValueOnce({}) // PutCommand message
+      .mockResolvedValueOnce({}) // UpdateCommand touch
+      .mockResolvedValueOnce({ Item: { orgId, plan: 'free' } }) // resolveTier
+      .mockResolvedValueOnce({}) // audit
+    mockSqsSend.mockResolvedValueOnce({})
+
+    const res = await makeApp().request(`/${conversationId}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'go anyway', bypassLedgerGating: true }),
+    })
+    expect(res.status).toBe(201)
+    expect(mockSqsSend).toHaveBeenCalledOnce()
   })
 
   it('rejects an empty message body', async () => {

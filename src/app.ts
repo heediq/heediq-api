@@ -6,6 +6,7 @@ import { requestIdMiddleware, type RequestIdContext } from './middleware/request
 import { meRouter } from './routes/me.js'
 import { sourcesRouter } from './routes/sources.js'
 import { contextsRouter } from './routes/contexts.js'
+import { ledgerRouter } from './routes/ledger.js'
 import { contextGrantsRouter } from './routes/context-grants.js'
 import { conversationsRouter } from './routes/conversations.js'
 import { uploadRouter } from './routes/upload.js'
@@ -47,6 +48,9 @@ v1.use('*', authMiddleware)
 v1.route('/me', meRouter)
 v1.route('/sources', sourcesRouter)
 v1.route('/contexts', contextsRouter)
+// Ledger read/fill routes (D-148) compose onto the same `/contexts` base as their own router —
+// paths are `/contexts/:id/ledger[/:entryId]`, disjoint from contextsRouter's own paths.
+v1.route('/contexts', ledgerRouter)
 v1.route('/context-grants', contextGrantsRouter)
 v1.route('/conversations', conversationsRouter)
 v1.route('/upload', uploadRouter)

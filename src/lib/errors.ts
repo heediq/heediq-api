@@ -10,6 +10,7 @@ type ErrorCode =
   | 'CONFLICT'
   | 'RATE_LIMITED'
   | 'WEAK_PASSWORD'
+  | 'LEDGER_GATED'
   | 'INTERNAL_ERROR'
 
 const statusForCode: Record<ErrorCode, ContentfulStatusCode> = {
@@ -20,6 +21,9 @@ const statusForCode: Record<ErrorCode, ContentfulStatusCode> = {
   CONFLICT: 409,
   RATE_LIMITED: 429,
   WEAK_PASSWORD: 400,
+  // D-149: chat-time ledger gating — the Context's unsettled ledger entries conflict with sending a
+  // turn until they're filled (or the caller bypasses). 409, consistent with other state conflicts.
+  LEDGER_GATED: 409,
   INTERNAL_ERROR: 500,
 }
 
