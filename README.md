@@ -23,10 +23,11 @@ All Heediq REST endpoints in a single Lambda function. Handles auth, Source CRUD
 - `tests/integration/setup-env.ts` — Vitest `setupFiles` entry: sets `DYNAMODB_ENDPOINT` + placeholder values for the other `config.ts` env vars
 - `src/routes/me.ts` — `GET /api/v1/me`; response includes `effectivePermissions` (D-102/D-105), the server-resolved permission set already parsed by `authMiddleware` from the `custom:permissions` JWT claim — the only source of authority `heediq-web`'s `usePermissions`/`<Can>` are allowed to read
 - `src/routes/users.ts` — `GET /api/v1/users` — org-scoped user list (D-102 Phase 4), used by the role/group assignment screen; read-open to any authenticated org member, same posture as `GET /roles`/`GET /groups`
-- `src/routes/sources.ts` — Source CRUD + job enqueue + summary fetch (D-068) + `POST /:id/review` (D-143/D-144): files approved extracted items into a Context
+- `src/routes/sources.ts` — Source CRUD + job enqueue + summary fetch (D-068) + `POST /:id/review` (D-143/D-144): files approved extracted items into a Context. After the kept items are committed and audited, the route best-effort enqueues a `LedgerJobMessage` (`{ jobId, contextId, sourceId, orgId, tier }`) onto the ledger SQS queue for `heediq-ledger` to reconcile (D-148) — only when `keptCount > 0` (nothing kept ⇒ nothing to reconcile), tier resolved via the same `heediq-orgs`-`plan` lookup used for chat/jobs. The enqueue is wrapped so a queue failure logs but never fails the already-committed review.
 - `src/routes/contexts.ts` — Context Library CRUD + tree (D-143/D-144): list/tree/create/get/patch/delete over `heediq-contexts`, keyed by the `by-scope` GSI (`scopeKey` = `U#<userId>`\|`G#<groupId>`\|`O#<orgId>`, `SK = domainCreatedAt`). `canAccessContext(c, item, minAccess?)` is the shared visibility gate (personal = owner-only, group = live-membership-checked against `heediq-role-assignments`, org = any org member); when the caller fails every same-org/visibility check and `minAccess` (`'read'`\|`'contribute'`) is passed, it falls through to `hasActiveGrant()` — a live `heediq-context-grants` lookup (D-142). PATCH/DELETE never pass `minAccess`, so a cross-org grant can never authorize mutating the Context entity itself; only `GET /:id` (at `'read'`) and `sources.ts`'s review route (at `'contribute'`) opt in. Also imported by `context-grants.ts` to gate grant issuance/listing against the target context.
+- `src/routes/ledger.ts` — Decision Ledger CRUD (D-136/D-148), mounted on `/contexts` (paths are disjoint from `contexts.ts`, which owns `/:id` itself): `GET /:id/ledger` lists a Context's `heediq-decision-ledger` entries (Query by `contextId`, paginated), `POST /:id/ledger` creates a manual entry, `PATCH /:id/ledger/:entryId` fills/edits one, `DELETE /:id/ledger/:entryId` removes one. Every route re-fetches the parent Context and runs `canAccessContext()` (D-141/D-142) — `GET` at `'read'`, all writes at `'contribute'` — so a `read`-only cross-org grant can view the ledger but not mutate it. The read route is gated `requirePermission('context:read')`, all writes `requirePermission('context:update')`. Every user-initiated write forces `origin: 'user'` and `confidence: 1.0` (a human answer is authoritative, unlike the auto-reconciled `heediq-ledger` entries); status is derived by `statusForUserAnswer(answer)` (`null → open`, else `confirmed`) unless the caller passes an explicit `status`. PATCH preserves the entry's original `createdAt`; `answer` is only overwritten when the key is present in the body (`'answer' in parsed.data`), so `PATCH { status }` alone keeps the existing answer and `PATCH { answer: null }` explicitly reopens. Audit payloads are ids/status/origin only (`{ entryId, contextId, status, origin }`, D-093) — the ledger `topic`/`answer` text is never logged; DELETE audits before-only.
 - `src/routes/context-grants.ts` — Cross-org Context grant issuance/revoke (D-142): `POST /api/v1/context-grants?contextId=` resolves `granteeEmail` to an existing account via `heediq-users`' `by-email` GSI (existing-accounts-only — no invite flow yet) and writes a `heediq-context-grants` row; `GET /api/v1/context-grants?contextId=` lists grants on a Context the caller can see (owner-side view, via the `by-context` GSI); `GET /api/v1/context-grants/shared-with-me` lists the caller's own live (non-expired) grants across every owner org; `DELETE /api/v1/context-grants/:contextId/:granteeUserId` hard-deletes the row — there is no `status`/`revokedAt`, the audited `DELETE` action is the historical record. All routes but `shared-with-me` are gated by `requirePermission('context:share')` (admin/owner-only, D-141).
-- `src/routes/conversations.ts` — Context chat (D-138/D-139): `POST /api/v1/conversations?contextId=` starts a thread on a Context; `GET /api/v1/conversations?contextId=` lists a Context's threads most-recently-active-first (`heediq-conversations`' `by-context` GSI); `GET /api/v1/conversations/:id/messages` returns the full turn history chronologically (`heediq-chat-messages`, PK=`conversationId`, no GSI needed); `POST /api/v1/conversations/:id/messages` persists the user's turn, bumps the parent conversation's `updatedAt`, resolves the org's tier (`resolveTier()`, same `heediq-orgs`-`plan` lookup `sources.ts` uses for job enqueue, D-067), and enqueues a `ChatJobMessage` directly onto the chat SQS queue for `heediq-chat` to consume. Every route re-fetches the parent Context and gates through `contexts.ts`'s `canAccessContext()`: starting a conversation or posting a message is treated as a `'contribute'`-tier use (drives a Claude turn against the Context's memory, not a passive read), while listing conversations or viewing message history only needs `'read'` — so a `'read'`-only cross-org grant (D-142) can view a shared thread but never start one or post into it. All four routes are gated by `requirePermission('context:read')` at the router level, with `canAccessContext`'s per-instance check doing the real narrowing. The audited `chatMessage:create` payload is ids/role only (`{ conversationId, messageId, role }`) — message `content` is never logged or audited (D-093).
+- `src/routes/conversations.ts` — Context chat (D-138/D-139): `POST /api/v1/conversations?contextId=` starts a thread on a Context; `GET /api/v1/conversations?contextId=` lists a Context's threads most-recently-active-first (`heediq-conversations`' `by-context` GSI); `GET /api/v1/conversations/:id/messages` returns the full turn history chronologically (`heediq-chat-messages`, PK=`conversationId`, no GSI needed); `POST /api/v1/conversations/:id/messages` persists the user's turn, bumps the parent conversation's `updatedAt`, resolves the org's tier (`resolveTier()`, same `heediq-orgs`-`plan` lookup `sources.ts` uses for job enqueue, D-067), and enqueues a `ChatJobMessage` directly onto the chat SQS queue for `heediq-chat` to consume. Every route re-fetches the parent Context and gates through `contexts.ts`'s `canAccessContext()`: starting a conversation or posting a message is treated as a `'contribute'`-tier use (drives a Claude turn against the Context's memory, not a passive read), while listing conversations or viewing message history only needs `'read'` — so a `'read'`-only cross-org grant (D-142) can view a shared thread but never start one or post into it. All four routes are gated by `requirePermission('context:read')` at the router level, with `canAccessContext`'s per-instance check doing the real narrowing. The audited `chatMessage:create` payload is ids/role only (`{ conversationId, messageId, role }`) — message `content` is never logged or audited (D-093). **D-149 chat-time ledger gating:** before persisting a turn, `POST /:id/messages` queries the Context's `heediq-decision-ledger` (paginated Query by `contextId`); if any entry is `open` or `needs_review` it returns `409 LEDGER_GATED` with `{ blockingEntries: [{ entryId, topic, status }] }` and persists/enqueues nothing — the client fills the entries via `PATCH /contexts/:id/ledger/:entryId` and retries, or resends with `bypassLedgerGating: true` to skip the gate. It is a synchronous DynamoDB read only — no Claude call, no WS event.
 - `src/routes/upload.ts` — `POST /api/v1/upload/presign` (S3 presigned URL)
 - `src/routes/auth.ts` — unauthenticated `/api/v1/auth` sub-app: `lookup-email` + D-087/D-089 cross-provider linking (`link/request-otp`, `link/verify-otp`, `link/confirm`)
 - `src/lib/cognito.ts` — Cognito Identity Provider SDK wrapper (`SignUp`, `ConfirmSignUp`, `ResendConfirmationCode`, `AdminSetUserPassword`, `AdminLinkProviderForUser`, `AdminDeleteUser`, `AdminCreateUser`, `ListUsers`) used by `routes/auth.ts` and the trigger handlers below
@@ -61,10 +62,11 @@ Client  →  API Gateway HTTP API  →  Lambda (Hono)
              /sources  →  DynamoDB (sources table) + SQS (transcription queue)
        /sources/:id/jobs  →  D-060 check + DynamoDB (jobs table) + SQS enqueue
        /sources/:id/items  →  org-keyed source existence gate + DynamoDB (extracted-items table, PK=sourceId)
- /sources/:id/review  →  canAccessContext('contribute') gate + DynamoDB (extracted-items + contexts + context-grants tables)
+ /sources/:id/review  →  canAccessContext('contribute') gate + DynamoDB (extracted-items + contexts + context-grants tables) + SQS (ledger queue, best-effort, D-148)
             /contexts  →  DynamoDB (contexts table, by-scope GSI) + canAccessContext gate (GET /:id also checks context-grants)
+   /contexts/:id/ledger  →  canAccessContext gate (via parent context) + DynamoDB (decision-ledger table, PK=contextId SK=entryId)
        /context-grants  →  DynamoDB (context-grants table, by-context GSI) + canAccessContext gate + by-email GSI (heediq-users)
-         /conversations  →  canAccessContext gate (via parent context) + DynamoDB (conversations table, by-context GSI; chat-messages table) + SQS (chat queue)
+         /conversations  →  canAccessContext gate (via parent context) + DynamoDB (conversations table, by-context GSI; chat-messages table; D-149 decision-ledger gating query) + SQS (chat queue)
    /upload/presign  →  S3 presigned PUT URL (client uploads directly to S3)
 ```
 
@@ -102,7 +104,12 @@ DELETE /api/v1/context-grants/:contextId/:granteeUserId                         
 POST   /api/v1/conversations?contextId=<id>    { title }                          -> { conversation }  (D-138/D-139, requires context:read + contribute-tier canAccessContext)
 GET    /api/v1/conversations?contextId=<id>                                       -> { conversations }  (D-138, requires context:read; most-recently-active first)
 GET    /api/v1/conversations/:id/messages                                         -> { messages }        (D-138, requires context:read; chronological)
-POST   /api/v1/conversations/:id/messages      { content }                        -> { message }         (D-138/D-139, requires context:read + contribute-tier canAccessContext; enqueues chat job)
+POST   /api/v1/conversations/:id/messages      { content, bypassLedgerGating? }   -> { message }         (D-138/D-139, requires context:read + contribute-tier canAccessContext; D-149 ledger gating → 409 LEDGER_GATED; enqueues chat job)
+
+GET    /api/v1/contexts/:id/ledger                                                -> { entries }         (D-136/D-148, requires context:read + read-tier canAccessContext)
+POST   /api/v1/contexts/:id/ledger             { topic, answer? }                 -> DecisionLedgerEntry  (D-136/D-148, 201, requires context:update + contribute; origin=user, confidence=1.0)
+PATCH  /api/v1/contexts/:id/ledger/:entryId    { topic?, answer?, status? }       -> DecisionLedgerEntry  (D-136/D-148, requires context:update + contribute; origin=user, confidence=1.0)
+DELETE /api/v1/contexts/:id/ledger/:entryId                                       -> { entryId }         (D-136/D-148, requires context:update + contribute)
 
 POST   /api/v1/auth/lookup-email      { email } -> { exists, passwordSet }              (unauthenticated)
 POST   /api/v1/auth/link/request-otp  { email }  -> { sent: true }                       (unauthenticated, D-087)
@@ -204,6 +211,9 @@ cascading.
 `canAccessContext(c, context, 'contribute')` on the target context (so a cross-org `'contribute'`
 grantee, not just a same-org member, can file items — a `'read'`-only grantee is rejected); writes an
 after-only `source:review` audit event via `auditWriter(c)` and returns `{ keptCount, discardedCount }`.
+When `keptCount > 0`, it then best-effort enqueues a `LedgerJobMessage` onto the ledger SQS queue for
+`heediq-ledger` to reconcile the kept items into the Context's Decision Ledger (D-148); the enqueue is
+wrapped in try/catch and logs on failure but never fails the already-committed review.
 
 **D-142 cross-org Context grants (`context-grants.ts`):** a regulated cross-org share of a single
 Context, existing-accounts-only (no invite/magic-link flow yet). `heediq-context-grants`' key IS the
@@ -229,6 +239,18 @@ worker reads the tier off the message body itself); `heediq-chat` (a separate wo
 it and streams the assistant's reply over the WS framework. Only the user's turn is persisted and
 enqueued here — the assistant's reply is written by `heediq-chat`, not this API.
 
+**D-136/D-148/D-149 Decision Ledger (`ledger.ts` + gating in `conversations.ts`):** `heediq-decision-ledger`
+(PK=`contextId`, SK=`entryId` — no `orgId` column; isolation rides the Context ownership chain via
+`canAccessContext`, same as conversations). An entry is `{ entryId, contextId, topic, answer|null, status,
+confidence, origin, sourceRefs[], createdAt, updatedAt }` (D-136). Two origins co-exist on one Context:
+`auto` entries written by the `heediq-ledger` worker at review time (D-148, confidence from Claude,
+status derived against `LEDGER_REVIEW_CONFIDENCE_THRESHOLD = 0.5`) and `user` entries created/edited
+through this API's CRUD routes (always `confidence: 1.0`, status `open`/`confirmed` — a human answer is
+authoritative). The CRUD routes never call Claude; they only read/write the table. **D-149 gating** is the
+consumer side: `POST /conversations/:id/messages` blocks a chat turn with `409 LEDGER_GATED` while any
+entry is `open`/`needs_review`, so the ledger must be settled (or explicitly bypassed) before the Context
+can be chatted over — the fill happens through `PATCH /contexts/:id/ledger/:entryId`.
+
 **Response envelope:** `{ ok: true, data: T }` | `{ ok: false, error: { code, message, details? } }`
 
 **API version prefix (D-088):** `/api/v1/` is written in exactly one place — the two `app.route()`
@@ -239,25 +261,26 @@ new router follows the same pattern — mount it in `app.ts`, don't hardcode the
 ## Dependencies
 
 - Upstream: `heediq-infra` (Lambda + API Gateway + DynamoDB + S3 + SQS must exist before deploy, D-050)
-- Upstream: `@heediq/shared` (Zod schemas + types, D-033) — pinned to `^0.15.3` (D-085/D-093 `createLogger` structured logger, mandatory per D-093; `passwordPolicy.ts`'s `isPasswordPolicyCompliant` is consumed in `routes/auth.ts`'s `/link/confirm`, D-094; D-102 adds the 5 RBAC request schemas and `buildAuditLogEntry()`, consumed by `routes/roles.ts`/`groups.ts`/`role-assignments.ts` and `lib/audit.ts`; D-114 adds `audit.ts`'s `effect` field and `permission` resourceType, consumed by `middleware/rbac.ts`; D-143/D-144 adds `Create/UpdateContextRequestSchema`, `ReviewApprovalRequestSchema`, `ExtractedItemSchema`, and the `context`/`extractedItemReview` `AuditPayloadMap` entries, consumed by `routes/contexts.ts` and the review route in `routes/sources.ts`; D-142 (0.15.2) fixes `ContextGrantSchema.expiresAt` to epoch-seconds and adds `CreateContextGrantRequestSchema` + the `contextGrant` `AuditPayloadMap` entry, consumed by `routes/context-grants.ts`; D-138/D-139 (0.15.3) adds `ConversationSchema`, `ChatMessageSchema`, `CreateConversationRequestSchema`, `CreateMessageRequestSchema`, `ChatJobMessage`, and the `conversation`/`chatMessage` `AuditPayloadMap` entries, consumed by `routes/conversations.ts`)
-- Upstream: `heediq-infra`'s `heediq-contexts`/`heediq-extracted-items`/`heediq-context-grants`/`heediq-conversations`/`heediq-chat-messages` tables + GSIs (D-143/D-144/D-142/D-138, ApiStack IAM grants + env vars) and the chat SQS queue (D-139, `CHAT_QUEUE_URL`)
+- Upstream: `@heediq/shared` (Zod schemas + types, D-033) — pinned to `^0.15.4` (D-085/D-093 `createLogger` structured logger, mandatory per D-093; `passwordPolicy.ts`'s `isPasswordPolicyCompliant` is consumed in `routes/auth.ts`'s `/link/confirm`, D-094; D-102 adds the 5 RBAC request schemas and `buildAuditLogEntry()`, consumed by `routes/roles.ts`/`groups.ts`/`role-assignments.ts` and `lib/audit.ts`; D-114 adds `audit.ts`'s `effect` field and `permission` resourceType, consumed by `middleware/rbac.ts`; D-143/D-144 adds `Create/UpdateContextRequestSchema`, `ReviewApprovalRequestSchema`, `ExtractedItemSchema`, and the `context`/`extractedItemReview` `AuditPayloadMap` entries, consumed by `routes/contexts.ts` and the review route in `routes/sources.ts`; D-142 (0.15.2) fixes `ContextGrantSchema.expiresAt` to epoch-seconds and adds `CreateContextGrantRequestSchema` + the `contextGrant` `AuditPayloadMap` entry, consumed by `routes/context-grants.ts`; D-138/D-139 (0.15.3) adds `ConversationSchema`, `ChatMessageSchema`, `CreateConversationRequestSchema`, `CreateMessageRequestSchema`, `ChatJobMessage`, and the `conversation`/`chatMessage` `AuditPayloadMap` entries, consumed by `routes/conversations.ts`; D-136/D-148/D-149 (0.15.4) adds `DecisionLedgerEntrySchema`, `Create/UpdateLedgerEntryRequestSchema`, `LedgerJobMessage`, `LedgerBlockingEntry`/`LedgerGatedDetails` + the `LEDGER_GATED` error code, and the `ledgerEntry` `AuditPayloadMap` entry, consumed by `routes/ledger.ts`, the review enqueue in `routes/sources.ts`, and the gating in `routes/conversations.ts`) — pin bumped to `^0.15.4`
+- Upstream: `heediq-infra`'s `heediq-contexts`/`heediq-extracted-items`/`heediq-context-grants`/`heediq-conversations`/`heediq-chat-messages`/`heediq-decision-ledger` tables + GSIs (D-143/D-144/D-142/D-138/D-136, ApiStack IAM grants + env vars) and the chat + ledger SQS queues (D-139 `CHAT_QUEUE_URL`; D-148 `LEDGER_QUEUE_URL`)
 - Downstream: `heediq-worker-transcription` (reads SQS messages enqueued here). `config.ts` also reads `SUMMARIZATION_QUEUE_URL`, but no route currently sends to it — the text-upload → summarization-queue direct path isn't wired up yet.
 - Downstream: `heediq-chat` (consumes `ChatJobMessage`s enqueued by `routes/conversations.ts` onto the chat SQS queue, D-139)
-- Shared surfaces: `heediq-sources`, `heediq-jobs`, `heediq-contexts`, `heediq-extracted-items`, `heediq-context-grants`, `heediq-conversations`, `heediq-chat-messages` DynamoDB tables
+- Downstream: `heediq-ledger` (consumes `LedgerJobMessage`s best-effort enqueued by the review route in `routes/sources.ts` onto the ledger SQS queue, D-148)
+- Shared surfaces: `heediq-sources`, `heediq-jobs`, `heediq-contexts`, `heediq-extracted-items`, `heediq-context-grants`, `heediq-conversations`, `heediq-chat-messages`, `heediq-decision-ledger` DynamoDB tables
 - Upstream (auth): `heediq-infra`'s `UserAuthMethodsTable`/`AuthAuditLogTable` (D-087) and the Cognito User Pool triggers wired to the 3 `auth-trigger-*.ts` handlers — see `heediq-infra/README.md`
 - Upstream (auth): `heediq-infra`'s `heediq-rate-limits` table (D-097) backing `src/lib/rateLimit.ts`
 
 ## Testing
 
 ```bash
-pnpm run test          # 260 unit tests (auth routes + auth methods + settings link + auth triggers + sources + contexts (incl. cross-org grant access) + context-grants + conversations (D-138/D-139 chat) + app routing + rate limiting + roles + groups + role-assignments + rbac + rbac-middleware + me + users + wsPush + ws-connect + ws-pusher + classification-pusher)
+pnpm run test          # 281 unit tests (auth routes + auth methods + settings link + auth triggers + sources (incl. D-148 ledger enqueue) + contexts (incl. cross-org grant access) + context-grants + ledger (D-136/D-148 CRUD) + conversations (D-138/D-139 chat + D-149 gating) + app routing + rate limiting + roles + groups + role-assignments + rbac + rbac-middleware + me + users + wsPush + ws-connect + ws-pusher + classification-pusher)
 pnpm run typecheck     # tsc --noEmit
 pnpm run test:pre-pr   # typecheck + test (run before opening a PR)
 pnpm run dev           # local dev server on :3000 (tsx watch)
 ```
 
 `pnpm run dev` calls `requireEnv()` in `config.ts` at cold start and crashes immediately if any of
-these 25 vars are unset — all real AWS resources deployed by `heediq-infra`, no local fakes:
+these 27 vars are unset — all real AWS resources deployed by `heediq-infra`, no local fakes:
 `COGNITO_USER_POOL_ID`, `COGNITO_CLIENT_ID`, `SOURCES_TABLE_NAME`, `ORGS_TABLE_NAME`,
 `USERS_TABLE_NAME`, `JOBS_TABLE_NAME`, `WS_CONNECTIONS_TABLE_NAME`, `USER_AUTH_METHODS_TABLE_NAME`,
 `AUTH_AUDIT_LOG_TABLE_NAME`, `RATE_LIMITS_TABLE_NAME`, `COGNITO_IDENTITIES_TABLE_NAME`,
@@ -265,6 +288,7 @@ these 25 vars are unset — all real AWS resources deployed by `heediq-infra`, n
 `GROUPS_TABLE_NAME`, `ROLE_ASSIGNMENTS_TABLE_NAME`, `AUDIT_LOG_TABLE_NAME`,
 `CONTEXTS_TABLE_NAME`, `EXTRACTED_ITEMS_TABLE_NAME`, `CONTEXT_GRANTS_TABLE_NAME`,
 `CONVERSATIONS_TABLE_NAME`, `CHAT_MESSAGES_TABLE_NAME`, `CHAT_QUEUE_URL`,
+`DECISION_LEDGER_TABLE_NAME`, `LEDGER_QUEUE_URL`,
 `WS_MANAGEMENT_ENDPOINT` (D-109). Pull the actual values
 from the deployed `dev` account (SSM params / CDK stack outputs, see `heediq-infra/README.md`) into
 a local `.env` and export before running `dev`.

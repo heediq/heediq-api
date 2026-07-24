@@ -14,10 +14,13 @@ import {
   ContextSchema,
   ConversationSchema,
   ChatMessageSchema,
+  DecisionLedgerEntrySchema,
   CreateConversationRequestSchema,
   CreateMessageRequestSchema,
   createLogger,
   type ChatJobMessage,
+  type LedgerBlockingEntry,
+  type LedgerGatedDetails,
 } from '@heediq/shared'
 
 const sqs = new SQSClient({})
@@ -158,6 +161,36 @@ conversations.post('/:id/messages', requirePermission('context:read'), async (c)
   const context = await loadContext(conversation.contextId)
   if (!context || !(await canAccessContext(c, context, 'contribute'))) {
     return apiError(c, 'NOT_FOUND', 'Conversation not found')
+  }
+
+  // D-149 chat-time ledger gating: unless the caller opts to bypass, block the turn when the
+  // Context has any `open`/`needs_review` ledger entry and list them so the client can prompt a
+  // fill. A cheap DynamoDB query (PK=contextId) — no Claude call, no WS event; nothing is persisted
+  // or enqueued on a block. The user fills via PATCH /ledger and retries, or resends with
+  // `bypassLedgerGating: true`.
+  if (!parsed.data.bypassLedgerGating) {
+    const blockingEntries: LedgerBlockingEntry[] = []
+    let lastKey: Record<string, unknown> | undefined
+    do {
+      const res = await dynamo.send(new QueryCommand({
+        TableName: config.dynamo.decisionLedgerTable,
+        KeyConditionExpression: 'contextId = :cid',
+        ExpressionAttributeValues: { ':cid': conversation.contextId },
+        ExclusiveStartKey: lastKey,
+      }))
+      for (const item of res.Items ?? []) {
+        const entry = DecisionLedgerEntrySchema.parse(item)
+        if (entry.status === 'open' || entry.status === 'needs_review') {
+          blockingEntries.push({ entryId: entry.entryId, topic: entry.topic, status: entry.status })
+        }
+      }
+      lastKey = res.LastEvaluatedKey
+    } while (lastKey)
+
+    if (blockingEntries.length > 0) {
+      const details: LedgerGatedDetails = { blockingEntries }
+      return apiError(c, 'LEDGER_GATED', 'Context has unsettled ledger entries', details)
+    }
   }
 
   const messageId = randomUUID()

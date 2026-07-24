@@ -26,6 +26,7 @@ import {
   createLogger,
   type Source,
   type TranscriptionJobMessage,
+  type LedgerJobMessage,
 } from '@heediq/shared'
 
 const sqs = new SQSClient({})
@@ -409,6 +410,43 @@ sources.post('/:id/review', requirePermission('sources:update'), async (c) => {
     action: 'source:review',
     after: { sourceId: id, contextId: parsed.data.contextId, keptCount, discardedCount },
   })
+
+  // Kick off Decision Ledger reconciliation for the newly-filed items (D-148). Best-effort and
+  // strictly after the review commit: a failed enqueue must never fail the review the user already
+  // completed — the ledger just stays at its prior state until the next reviewed source (there is
+  // no ledger_failed path, D-148). Skipped when nothing was kept — no new items to reconcile.
+  if (keptCount > 0) {
+    try {
+      const orgRes = await dynamo.send(new GetCommand({ TableName: config.dynamo.orgsTable, Key: { orgId } }))
+      const tier = (orgRes.Item?.['plan'] ?? 'free') as 'free' | 'paid'
+      const ledgerJob: LedgerJobMessage = {
+        jobId: randomUUID(),
+        contextId: parsed.data.contextId,
+        sourceId: id,
+        orgId,
+        tier,
+      }
+      await sqs.send(new SendMessageCommand({
+        QueueUrl: config.sqs.ledgerQueueUrl,
+        MessageBody: JSON.stringify(ledgerJob),
+      }))
+      logger.info('Ledger reconciliation enqueued', {
+        requestId: c.get('requestId'),
+        sourceId: id,
+        contextId: parsed.data.contextId,
+        jobId: ledgerJob.jobId,
+        tier,
+      })
+    } catch (err) {
+      logger.error('Ledger reconciliation enqueue failed (review still committed)', {
+        requestId: c.get('requestId'),
+        sourceId: id,
+        contextId: parsed.data.contextId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
   return ok(c, { keptCount, discardedCount })
 })
 

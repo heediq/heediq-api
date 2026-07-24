@@ -28,14 +28,15 @@ export const config = {
     groupsTable: requireEnv('GROUPS_TABLE_NAME'),
     roleAssignmentsTable: requireEnv('ROLE_ASSIGNMENTS_TABLE_NAME'),
     auditLogTable: requireEnv('AUDIT_LOG_TABLE_NAME'),
-    // Context Library (D-124–D-143) — step 4b's two tables plus context-grants (step 4c-i) and now
-    // conversations/chat-messages (step 4c-ii). decision-ledger stays unconsumed until a later
-    // sub-step adds its route — added here only once a route actually reads/writes it, per D-103.
+    // Context Library (D-124–D-143) — step 4b's two tables plus context-grants (step 4c-i),
+    // conversations/chat-messages (step 4c-ii), and decision-ledger (step 6/D-148: the ledger
+    // read/fill routes + chat-time gating read it; the heediq-ledger worker owns the write path).
     contextsTable: requireEnv('CONTEXTS_TABLE_NAME'),
     extractedItemsTable: requireEnv('EXTRACTED_ITEMS_TABLE_NAME'),
     contextGrantsTable: requireEnv('CONTEXT_GRANTS_TABLE_NAME'),
     conversationsTable: requireEnv('CONVERSATIONS_TABLE_NAME'),
     chatMessagesTable: requireEnv('CHAT_MESSAGES_TABLE_NAME'),
+    decisionLedgerTable: requireEnv('DECISION_LEDGER_TABLE_NAME'),
   },
   s3: {
     audioBucket: requireEnv('AUDIO_BUCKET_NAME'),
@@ -45,6 +46,7 @@ export const config = {
     transcriptionQueueUrl: requireEnv('TRANSCRIPTION_QUEUE_URL'),
     summarizationQueueUrl: requireEnv('SUMMARIZATION_QUEUE_URL'),
     chatQueueUrl: requireEnv('CHAT_QUEUE_URL'),
+    ledgerQueueUrl: requireEnv('LEDGER_QUEUE_URL'),
   },
   ws: {
     managementEndpoint: requireEnv('WS_MANAGEMENT_ENDPOINT'),
