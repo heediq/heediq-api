@@ -665,3 +665,134 @@ describe('POST /:id/review', () => {
     expect(body.data.keptCount).toBe(1)
   })
 })
+
+describe('POST /:id/text — text-file ingest (D-150 / D-065)', () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  it('returns 403 without sources:create permission', async () => {
+    const res = await makeApp('member', []).request(`/${uuid}/text`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'Some notes' }),
+    })
+    expect(res.status).toBe(403)
+  })
+
+  it('rejects an empty text body', async () => {
+    const res = await makeApp().request(`/${uuid}/text`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: '' }),
+    })
+    expect(res.status).toBe(400)
+  })
+
+  it('returns 404 when the source is missing or from another org', async () => {
+    mockDynamoSend
+      .mockResolvedValueOnce({ Item: undefined }) // source Get misses
+      .mockResolvedValueOnce({ Item: { orgId, plan: 'free' } }) // org Get (runs in the same Promise.all)
+    const res = await makeApp().request(`/${uuid}/text`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'Some notes' }),
+    })
+    expect(res.status).toBe(404)
+  })
+
+  it('writes the transcript onto the source (status→processing, sourceType→text) then enqueues a summarization job', async () => {
+    mockDynamoSend
+      .mockResolvedValueOnce({ Item: existingSource }) // source Get
+      .mockResolvedValueOnce({ Item: { orgId, plan: 'free' } }) // org Get
+      .mockResolvedValueOnce({}) // UpdateCommand — transcript write
+    mockSqsSend.mockResolvedValueOnce({})
+
+    const res = await makeApp().request(`/${uuid}/text`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'The export must be CSV.' }),
+    })
+    expect(res.status).toBe(201)
+    const body = await res.json() as { data: { jobId: string } }
+    expect(body.data.jobId).toBeTruthy()
+
+    // Transcript + status/sourceType committed on the org-keyed source row before enqueue.
+    expect(mockDynamoSend).toHaveBeenNthCalledWith(3,
+      expect.objectContaining({
+        input: expect.objectContaining({
+          Key: { orgId, sourceId: uuid },
+          ExpressionAttributeValues: expect.objectContaining({
+            ':transcript': 'The export must be CSV.',
+            ':status': 'processing',
+            ':sourceType': 'text',
+          }),
+        }),
+      }),
+    )
+
+    // Enqueued to the summarization queue with sourceType='text' and contentRef=sourceId (the
+    // worker reads the transcript off the source row — D-065), plus the tier message attribute.
+    expect(mockSqsSend).toHaveBeenCalledOnce()
+    const call = mockSqsSend.mock.calls[0][0]
+    expect(call.QueueUrl).toBe('https://sqs/summarization')
+    expect(call.MessageAttributes).toEqual({ tier: { DataType: 'String', StringValue: 'free' } })
+    const message = JSON.parse(call.MessageBody)
+    expect(message).toMatchObject({ sourceType: 'text', contentRef: uuid, sourceId: uuid, orgId, tier: 'free' })
+  })
+
+  it('stamps the org plan tier onto the job (paid)', async () => {
+    mockDynamoSend
+      .mockResolvedValueOnce({ Item: existingSource })
+      .mockResolvedValueOnce({ Item: { orgId, plan: 'paid' } })
+      .mockResolvedValueOnce({})
+    mockSqsSend.mockResolvedValueOnce({})
+
+    await makeApp().request(`/${uuid}/text`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'Notes' }),
+    })
+    const message = JSON.parse(mockSqsSend.mock.calls[0][0].MessageBody)
+    expect(message.tier).toBe('paid')
+    expect(mockSqsSend.mock.calls[0][0].MessageAttributes.tier.StringValue).toBe('paid')
+  })
+
+  it('returns 404 when the transcript write loses a create→delete race (conditional check fails)', async () => {
+    mockDynamoSend
+      .mockResolvedValueOnce({ Item: existingSource })
+      .mockResolvedValueOnce({ Item: { orgId, plan: 'free' } })
+      .mockRejectedValueOnce(Object.assign(new Error('conflict'), { name: 'ConditionalCheckFailedException' }))
+    const res = await makeApp().request(`/${uuid}/text`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'Notes' }),
+    })
+    expect(res.status).toBe(404)
+    expect(mockSqsSend).not.toHaveBeenCalled()
+  })
+
+  it('marks the source failed and 500s when the enqueue fails after the transcript is committed', async () => {
+    mockDynamoSend
+      .mockResolvedValueOnce({ Item: existingSource }) // source Get
+      .mockResolvedValueOnce({ Item: { orgId, plan: 'free' } }) // org Get
+      .mockResolvedValueOnce({}) // transcript write
+      .mockResolvedValueOnce({}) // status→failed rollback
+    mockSqsSend.mockRejectedValueOnce(new Error('SQS unavailable'))
+
+    const res = await makeApp().request(`/${uuid}/text`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'Notes' }),
+    })
+    expect(res.status).toBe(500)
+    const body = await res.json() as { error: { code: string } }
+    expect(body.error.code).toBe('INTERNAL_ERROR')
+    // The source was flipped to `failed` so it doesn't sit stuck in `processing`.
+    expect(mockDynamoSend).toHaveBeenNthCalledWith(4,
+      expect.objectContaining({
+        input: expect.objectContaining({
+          ExpressionAttributeValues: expect.objectContaining({ ':status': 'failed' }),
+        }),
+      }),
+    )
+  })
+})

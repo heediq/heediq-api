@@ -23,9 +23,11 @@ import {
   EnqueueJobRequestSchema,
   PresignUploadRequestSchema,
   ReviewApprovalRequestSchema,
+  IngestTextRequestSchema,
   createLogger,
   type Source,
   type TranscriptionJobMessage,
+  type SummarizationJobMessage,
   type LedgerJobMessage,
 } from '@heediq/shared'
 
@@ -293,6 +295,103 @@ sources.post('/:id/jobs', async (c) => {
     model: parsed.data.model,
   })
   return ok(c, { job: JobSchema.parse(jobItem) }, 201)
+})
+
+// POST /api/v1/sources/:id/text — text-file ingest, the skip-transcription path (D-150 / D-065).
+// The client reads an uploaded text file client-side and posts its raw text here. We write it onto
+// the Source's `transcript` attribute — exactly where heediq-worker-summarization's content-loader
+// reads it when sourceType='text' (contentRef IS the sourceId, not an S3 key) — then enqueue a
+// summarization job directly, never touching the transcription pipeline. No tier-gating: text has
+// no model choice (unlike /jobs' whisper model), so `tier` is read only to stamp the job for the
+// summarizer's Claude-model routing, mirroring the transcription worker's own enqueue.
+sources.post('/:id/text', requirePermission('sources:create'), async (c) => {
+  const orgId = c.get('orgId')
+  const id = c.req.param('id')
+  const body = await c.req.json()
+  const parsed = IngestTextRequestSchema.safeParse(body)
+  if (!parsed.success) {
+    return apiError(c, 'BAD_REQUEST', 'Invalid request body', parsed.error.flatten())
+  }
+
+  const [srcRes, orgRes] = await Promise.all([
+    dynamo.send(new GetCommand({ TableName: config.dynamo.sourcesTable, Key: { orgId, sourceId: id } })),
+    dynamo.send(new GetCommand({ TableName: config.dynamo.orgsTable, Key: { orgId } })),
+  ])
+  if (!srcRes.Item) {
+    return apiError(c, 'NOT_FOUND', 'Source not found')
+  }
+  const tier = (orgRes.Item?.['plan'] ?? 'free') as 'free' | 'paid'
+
+  const jobId = randomUUID()
+  const now = new Date().toISOString()
+
+  // Commit the transcript + flip status→processing / sourceType→text BEFORE enqueue: the worker
+  // reads `transcript` straight off this row, so it must be durably written first. Conditioned on
+  // the source still existing to close the create→delete race (matches PATCH/DELETE above).
+  try {
+    await dynamo.send(new UpdateCommand({
+      TableName: config.dynamo.sourcesTable,
+      Key: { orgId, sourceId: id },
+      ConditionExpression: 'attribute_exists(sourceId)',
+      UpdateExpression:
+        'SET transcript = :transcript, #status = :status, sourceType = :sourceType, updatedAt = :now',
+      ExpressionAttributeNames: { '#status': 'status' },
+      ExpressionAttributeValues: {
+        ':transcript': parsed.data.text,
+        ':status': 'processing',
+        ':sourceType': 'text',
+        ':now': now,
+      },
+    }))
+  } catch (err: unknown) {
+    if (isAwsError(err) && err.name === 'ConditionalCheckFailedException') {
+      return apiError(c, 'NOT_FOUND', 'Source not found')
+    }
+    throw err
+  }
+
+  const message: SummarizationJobMessage = {
+    jobId,
+    sourceId: id,
+    orgId,
+    sourceType: 'text',
+    contentRef: id,
+    tier,
+  }
+  try {
+    await sqs.send(new SendMessageCommand({
+      QueueUrl: config.sqs.summarizationQueueUrl,
+      MessageBody: JSON.stringify(message),
+      MessageAttributes: {
+        tier: { DataType: 'String', StringValue: tier },
+      },
+    }))
+  } catch (err) {
+    // Enqueue failed after the transcript was committed — mark the source `failed` so it never sits
+    // stuck in `processing`. Log ids only; the transcript body is never logged (D-101 privacy).
+    logger.error('Text summarization enqueue failed', {
+      requestId: c.get('requestId'),
+      sourceId: id,
+      jobId,
+      error: err instanceof Error ? err.message : String(err),
+    })
+    await dynamo.send(new UpdateCommand({
+      TableName: config.dynamo.sourcesTable,
+      Key: { orgId, sourceId: id },
+      UpdateExpression: 'SET #status = :status, updatedAt = :now',
+      ExpressionAttributeNames: { '#status': 'status' },
+      ExpressionAttributeValues: { ':status': 'failed', ':now': new Date().toISOString() },
+    }))
+    return apiError(c, 'INTERNAL_ERROR', 'Failed to enqueue text for processing')
+  }
+
+  logger.info('Text ingest enqueued', {
+    requestId: c.get('requestId'),
+    sourceId: id,
+    jobId,
+    tier,
+  })
+  return ok(c, { jobId }, 201)
 })
 
 // GET /api/v1/sources/:id/summary
