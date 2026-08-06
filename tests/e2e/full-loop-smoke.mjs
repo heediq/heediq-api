@@ -29,17 +29,17 @@
 // Usage:
 //   API_BASE=https://<api-id>.execute-api.eu-west-1.amazonaws.com \
 //   WS_URL=wss://<ws-id>.execute-api.eu-west-1.amazonaws.com/ws \
-//   ID_TOKEN=<cognito id token>            # or TOKEN_FILE=/path/to/token
+//   ID_TOKEN=<cognito id token>            # or TOKEN_FILE, or provision from a seeded test user
 //   node tests/e2e/full-loop-smoke.mjs
 //
-// ID_TOKEN must be the Cognito **ID** token (carries custom:orgId/custom:role), not the access token.
-// Get one by signing a dev user in via USER_PASSWORD_AUTH and taking the IdToken.
+// The Cognito **ID** token (carries custom:orgId/custom:role) is resolved by ./lib/auth.mjs — pass
+// ID_TOKEN/TOKEN_FILE, or COGNITO_CLIENT_ID + TEST_USER_EMAIL + TEST_USER_PASSWORD to provision one.
 // Exit code: 0 pass, 1 assertion fail, 2 fatal/config error.
-import { readFileSync } from 'node:fs'
+import { resolveIdToken } from './lib/auth.mjs'
 
 const API = required('API_BASE', process.env.API_BASE)
 const WS = required('WS_URL', process.env.WS_URL)
-const TOKEN = resolveToken()
+const TOKEN = await resolveIdToken()
 
 const H = { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' }
 const log = (...a) => console.log(new Date().toISOString().slice(11, 23), ...a)
@@ -65,15 +65,6 @@ function required(name, value) {
     process.exit(2)
   }
   return value
-}
-
-function resolveToken() {
-  const raw = process.env.ID_TOKEN ?? (process.env.TOKEN_FILE && readFileSync(process.env.TOKEN_FILE, 'utf8'))
-  if (!raw) {
-    console.error('Missing auth token: set ID_TOKEN or TOKEN_FILE. See usage at the top of this file.')
-    process.exit(2)
-  }
-  return raw.trim()
 }
 
 async function api(method, path, body) {

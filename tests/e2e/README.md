@@ -1,15 +1,32 @@
-# E2E smoke (`tests/e2e/`)
+# E2E suite (`tests/e2e/`)
 
-D-147: each user-facing flow ships a scripted happy-path smoke that runs against the **real deployed
-stack** (real auth token, real API, real WS + SQS/workers). These run **deliberately** — after
-deploying to an environment, before calling it done — **not** as part of the local pre-PR gate (D-030
-layer table). They exist to catch deploy/config/wiring/permission gaps that mocked unit + integration
-tests structurally cannot.
+**D-156**: Heediq's E2E is a **single full real-backend suite** — real Cognito auth, real REST API +
+WebSocket, real SQS/workers, real data create+teardown. It runs at **two moments only**:
+
+- **Promote-to-staging gate** — automatically on push to `main` (the develop→main promotion), against
+  the live **dev** stack, *before* `deploy-staging` (heediq-api `.github/workflows/deploy.yml`, job
+  `e2e`). At promotion, `main` HEAD == what already runs on dev, so the dev stack is the proving ground.
+- **Locally, on demand** — run it by hand against any deployed stack when you want end-to-end proof.
+
+It does **not** run per-PR and **not** on the dev deploy (that was D-155's dropped mocked tier). This
+absorbs the old D-147 "scripted smoke per feature" scripts — they are that suite.
 
 Standalone Node scripts (Node ≥ 22 for global `fetch`/`WebSocket`) — no test framework, per D-147's
 "lightweight Node script is acceptable for headless API+WS/queue flows."
 
-## `full-loop-smoke.mjs` — the whole MVP critical path
+## `lib/auth.mjs` — shared token provisioning
+Every script needs a Cognito **ID** token (it carries `custom:orgId`/`custom:role`/`custom:accountId`;
+the access token does not). `resolveIdToken()`:
+- **Override** — `ID_TOKEN=<token>` or `TOKEN_FILE=/path` (back-compat, for a hand-provisioned token).
+- **Provision** — else signs a seeded dev test user in via Cognito `USER_PASSWORD_AUTH` (ROPC) and takes
+  the `IdToken`. Needs `COGNITO_CLIENT_ID` + `TEST_USER_EMAIL` + `TEST_USER_PASSWORD` (and
+  `AWS_REGION`/`COGNITO_REGION`, default `eu-west-1`). It's a raw public Cognito call — **no AWS creds**.
+
+The test user must already exist, be **CONFIRMED**, and have a **permanent** password; the app client
+must have `USER_PASSWORD_AUTH` enabled. Provisioning deliberately does not create users or answer
+`NEW_PASSWORD_REQUIRED` (that needs admin creds — a one-off setup script, not the per-run path).
+
+## `full-loop-smoke.mjs` — the whole MVP critical path (gate default)
 Proves the **capture → classify/extract → review → file-into-Context → chat** loop end to end on one
 deploy — the front half plus the handoff into chat that `chat-smoke.mjs` (heediq-chat) does not cover:
 
@@ -22,33 +39,45 @@ deploy — the front half plus the handoff into chat that `chat-smoke.mjs` (heed
 7. `GET /sources/:id/items` → assert the kept items now carry `status:'kept'` + the `contextId`
 8. `POST /conversations` + `POST /conversations/:id/messages` → assert `chat_delta` stream + `chat_complete`
 
-Then it deletes the ephemeral Context (conversation/messages cascade) and the Source.
+Then it deletes the ephemeral Context (conversation/messages cascade) and the Source. This is the
+**deterministic** path (no GPU), so it's what the promote-to-staging gate runs (`pnpm run e2e`).
 
-**Scope notes**
-- **Text ingest, not audio.** The audio path (`POST /sources/:id/jobs` → GPU Whisper worker) is
-  deliberately out — real transcription needs GPU Spot capacity and is too slow/flaky for a repeatable
-  smoke. Add a separate, manually-run audio smoke when that path needs deploy-level proof.
-- **`bypassLedgerGating: true`** on the chat turn (D-149): review reconciliation (D-148) can leave the
-  fresh Context's Decision Ledger with `needs_review` entries, which would otherwise `409 LEDGER_GATED`.
-  This smoke exercises the loop wiring, not the gate (the gate has unit coverage).
+`bypassLedgerGating: true` on the chat turn (D-149): review reconciliation (D-148) can leave the fresh
+Context's Decision Ledger with `needs_review` entries, which would otherwise `409 LEDGER_GATED`. This
+smoke exercises the loop wiring, not the gate (the gate has unit coverage).
+
+## `audio-smoke.mjs` — the audio / transcription path (opt-in)
+The one leg `full-loop-smoke.mjs` skips: **presign → S3 PUT → `POST /:id/jobs` → GPU Whisper worker →
+summarization**. It synthesizes a ~1s tone WAV in-process (no committed binary fixture), uploads it,
+enqueues a `small`-model job, and waits for the pipeline to reach a terminal `done`/`ready`.
+
+**Opt-in, not part of the gate** — it depends on EC2 GPU Spot capacity coming up, so it's slow and
+capacity-flaky. It asserts the pipeline *ran end to end*; it does **not** assert transcript wording or
+item counts (a tone carries no words — those are logged best-effort). Run it on demand when the audio
+path itself needs deploy-level proof. Timeout: `TRANSCRIBE_TIMEOUT_MS` (default 600000).
 
 ## `../../../heediq-chat/tests/e2e/chat-smoke.mjs` — Context chat happy path
 The first D-147 instance (lives in heediq-chat). Creates a Context → conversation → posts a message →
 asserts the streamed reply. `full-loop-smoke.mjs` is the superset for the capture→review→chat path;
 `chat-smoke.mjs` stays as the focused chat-only smoke.
 
-## Run
+## Run locally
 ```sh
 API_BASE=https://<api-id>.execute-api.eu-west-1.amazonaws.com \
 WS_URL=wss://<ws-id>.execute-api.eu-west-1.amazonaws.com/ws \
-ID_TOKEN=<cognito ID token> \
-pnpm run e2e:full-loop
+COGNITO_CLIENT_ID=<app client id> \
+TEST_USER_EMAIL=<seeded dev user> TEST_USER_PASSWORD=<password> \
+pnpm run e2e          # full-loop (gate default). Or: ID_TOKEN=<token> to skip provisioning.
+
+pnpm run e2e:audio    # opt-in GPU audio path
 ```
-- **`ID_TOKEN`** must be the Cognito **ID** token (carries `custom:orgId`/`custom:role`), not the
-  access token. Alternatively point `TOKEN_FILE` at a file containing it. Get one by signing a dev user
-  in via `USER_PASSWORD_AUTH` and taking the `IdToken`.
+- `pnpm run e2e` === `pnpm run e2e:full-loop`.
 - Optional: `CLASSIFY_TIMEOUT_MS` (default 120000), `CHAT_TIMEOUT_MS` (default 90000).
 - Exit code: `0` pass · `1` assertion fail · `2` fatal/config error.
 
-> **Still owed (D-147 backlog):** a shared token-provisioning helper (both smokes currently take a
-> hand-provisioned `ID_TOKEN`) and CI wiring to run these post-deploy automatically.
+## In CI (promote-to-staging gate)
+`.github/workflows/deploy.yml` job `e2e` (on `main` only): reads `API_BASE`/`WS_URL`/`COGNITO_CLIENT_ID`
+from the **dev** account's SSM (`/heediq/api/endpoint-url`, `/heediq/api/ws-endpoint-url`,
+`/heediq/api/cognito-client-id`) and provisions the token from `E2E_TEST_USER_EMAIL` /
+`E2E_TEST_USER_PASSWORD` secrets. `deploy-staging` `needs: [build, e2e]`, so a red E2E blocks staging
+(and thus prod). The audio smoke is not wired here — it stays a deliberate manual run.
