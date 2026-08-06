@@ -13,6 +13,9 @@ process.env['ROLE_ASSIGNMENTS_TABLE_NAME'] = 'heediq-role-assignments'
 const send = vi.fn()
 vi.mock('../lib/dynamo.js', () => ({ dynamo: { send: (...args: unknown[]) => send(...args) } }))
 
+const emitServerAnalytics = vi.hoisted(() => vi.fn())
+vi.mock('../lib/analytics.js', () => ({ emitServerAnalytics }))
+
 const { handler } = await import('../handlers/auth-provision.js')
 
 function baseEvent(overrides: Record<string, string> = {}): PreTokenGenerationTriggerEvent {
@@ -41,7 +44,7 @@ function mockNewOrgProvisioning() {
 }
 
 describe('auth-provision handler', () => {
-  beforeEach(() => { send.mockReset() })
+  beforeEach(() => { send.mockReset(); emitServerAnalytics.mockReset() })
 
   it('resolves via the identities table and returns claims with a single lookup', async () => {
     send
@@ -166,5 +169,33 @@ describe('auth-provision handler', () => {
 
     const userPut = send.mock.calls[5]?.[0] as { input: { Item: Record<string, unknown> } }
     expect(userPut.input.Item['passwordSet']).toBe(true)
+  })
+
+  it('emits a user_provisioned {tier:free} server event keyed to the new account+org (D-154)', async () => {
+    send
+      .mockResolvedValueOnce({ Item: undefined })
+      .mockResolvedValueOnce({ Items: [] })
+    mockNewOrgProvisioning()
+
+    const result = await handler(baseEvent(), {} as never, () => undefined) as PreTokenGenerationTriggerEvent
+    const claims = result.response.claimsOverrideDetails?.claimsToAddOrOverride as Record<string, string>
+
+    expect(emitServerAnalytics).toHaveBeenCalledTimes(1)
+    expect(emitServerAnalytics).toHaveBeenCalledWith({
+      identity: { userId: claims['custom:accountId'], orgId: claims['custom:orgId'] },
+      type: 'user_provisioned',
+      payload: { tier: 'free' },
+    })
+  })
+
+  it('does not emit user_provisioned when an existing user is resolved (no new org)', async () => {
+    send
+      .mockResolvedValueOnce({ Item: { sub: 'user-1', accountId: 'account-1' } })
+      .mockResolvedValueOnce({ Item: { userId: 'account-1', orgId: 'org-1', role: 'member' } })
+      .mockResolvedValueOnce({ Items: [] })
+
+    await handler(baseEvent(), {} as never, () => undefined)
+
+    expect(emitServerAnalytics).not.toHaveBeenCalled()
   })
 })

@@ -1,5 +1,5 @@
 import type { PostAuthenticationTriggerHandler } from 'aws-lambda'
-import { PutCommand } from '@aws-sdk/lib-dynamodb'
+import { PutCommand, GetCommand } from '@aws-sdk/lib-dynamodb'
 import {
   CognitoIdentityProviderClient,
   ListUsersCommand,
@@ -8,7 +8,8 @@ import {
 } from '@aws-sdk/client-cognito-identity-provider'
 import { dynamo } from '../lib/dynamo.js'
 import { resolveAccountIdBySub, resolveAccountIdByEmail, linkIdentity } from '../lib/accountIdentity.js'
-import { createLogger } from '@heediq/shared'
+import { createLogger, AnalyticsAuthMethodSchema } from '@heediq/shared'
+import { emitServerAnalytics } from '../lib/analytics.js'
 
 function requireEnv(name: string): string {
   const v = process.env[name]
@@ -78,6 +79,25 @@ async function putAudit(accountId: string, action: string, provider: string, det
   }))
 }
 
+// Server-side `login_completed` (D-154): the authoritative sign-in outcome, emitted once per
+// successful authentication. `method` is the provider used (native = 'password'); anything not in
+// the shared auth-method enum is skipped rather than guessed. Requires the user's orgId, so it
+// reads the USERS row — which for a genuinely-new user doesn't exist yet at PostAuthentication time
+// (PreTokenGeneration writes it moments later), so a first login emits nothing here and is captured
+// by `user_provisioned` instead. Fail-safe: emitServerAnalytics never throws / is latency-bounded.
+async function emitLoginCompleted(accountId: string, method: string): Promise<void> {
+  const parsed = AnalyticsAuthMethodSchema.safeParse(method)
+  if (!parsed.success) return
+  const user = await dynamo.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId: accountId } }))
+  const orgId = user.Item?.['orgId']
+  if (typeof orgId !== 'string') return
+  await emitServerAnalytics({
+    identity: { userId: accountId, orgId },
+    type: 'login_completed',
+    payload: { method: parsed.data },
+  })
+}
+
 // Fires on every successful sign-in, before PreTokenGeneration (auth-provision.ts). Two jobs:
 // (1) record this session's auth method if it's federated and not yet recorded, and (2) if the
 // user signed in via a provider that isn't yet linked to their native/canonical account,
@@ -132,6 +152,12 @@ export const handler: PostAuthenticationTriggerHandler = async (event) => {
     await putAudit(canonicalAccountId, 'POST_AUTH_PROVIDER_CONTEXT_MISSING', 'UNKNOWN', 'External-provider login had no resolvable identities payload')
     return event
   }
+
+  // Emit login_completed once the auth method is known — native sign-ins are 'password', federated
+  // ones map from the provider name. Placed before the auth-method/link bookkeeping below so it
+  // fires for every successful sign-in regardless of which of those branches returns first.
+  const method = currentIsExternal && providerContext ? providerContext.providerName.toLowerCase() : 'password'
+  await emitLoginCompleted(canonicalAccountId, method)
 
   if (currentIsExternal && providerContext) {
     await upsertAuthMethod(canonicalAccountId, providerContext.providerName, providerContext.providerSub, username)

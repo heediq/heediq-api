@@ -1,9 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import type { DynamoDBStreamEvent } from 'aws-lambda'
 
+process.env['SOURCES_TABLE_NAME'] = 'heediq-sources'
+
 const mockPushToOrg = vi.hoisted(() => vi.fn())
+const dynamoSend = vi.hoisted(() => vi.fn())
+const emitServerAnalytics = vi.hoisted(() => vi.fn())
 
 vi.mock('../lib/wsPush.js', () => ({ pushToOrg: mockPushToOrg }))
+vi.mock('../lib/dynamo.js', () => ({ dynamo: { send: (...args: unknown[]) => dynamoSend(...args) } }))
+vi.mock('../lib/analytics.js', () => ({ emitServerAnalytics }))
 
 const { handler } = await import('../handlers/ws-pusher.js')
 
@@ -36,7 +42,20 @@ function makeStreamEvent(overrides: {
 
 beforeEach(() => {
   mockPushToOrg.mockReset()
+  dynamoSend.mockReset()
+  emitServerAnalytics.mockReset()
 })
+
+function terminalEvent(status: 'done' | 'failed'): DynamoDBStreamEvent {
+  return makeStreamEvent({
+    newImage: {
+      jobId: { S: jobId },
+      sourceId: { S: sourceId },
+      orgId: { S: orgId },
+      status: { S: status },
+    },
+  })
+}
 
 describe('ws-pusher handler', () => {
   it('pushes a job_status event at org scope on MODIFY', async () => {
@@ -79,5 +98,56 @@ describe('ws-pusher handler', () => {
   it('propagates errors from pushToOrg so DDB Streams retries the batch', async () => {
     mockPushToOrg.mockRejectedValueOnce(new Error('push failed'))
     await expect(handler(makeStreamEvent({}), {} as never, () => undefined)).rejects.toThrow('push failed')
+  })
+
+  it('emits source_processing_completed with the source uploader on a terminal done status', async () => {
+    mockPushToOrg.mockResolvedValueOnce(undefined)
+    dynamoSend.mockResolvedValueOnce({ Item: { orgId, sourceId, userId: 'uploader-1' } })
+
+    await handler(terminalEvent('done'), {} as never, () => undefined)
+
+    expect(emitServerAnalytics).toHaveBeenCalledWith({
+      identity: { userId: 'uploader-1', orgId },
+      type: 'source_processing_completed',
+      payload: { sourceId, jobId, status: 'done' },
+    })
+  })
+
+  it('carries the failed terminal status through to the event', async () => {
+    mockPushToOrg.mockResolvedValueOnce(undefined)
+    dynamoSend.mockResolvedValueOnce({ Item: { orgId, sourceId, userId: 'uploader-1' } })
+
+    await handler(terminalEvent('failed'), {} as never, () => undefined)
+
+    expect(emitServerAnalytics).toHaveBeenCalledWith(
+      expect.objectContaining({ payload: { sourceId, jobId, status: 'failed' } }),
+    )
+  })
+
+  it('does not emit on a non-terminal status, and never looks up the source', async () => {
+    mockPushToOrg.mockResolvedValueOnce(undefined)
+
+    await handler(makeStreamEvent({}), {} as never, () => undefined) // default status: transcribing
+
+    expect(dynamoSend).not.toHaveBeenCalled()
+    expect(emitServerAnalytics).not.toHaveBeenCalled()
+  })
+
+  it('skips the emit when the source row has no uploader', async () => {
+    mockPushToOrg.mockResolvedValueOnce(undefined)
+    dynamoSend.mockResolvedValueOnce({ Item: undefined })
+
+    await handler(terminalEvent('done'), {} as never, () => undefined)
+
+    expect(emitServerAnalytics).not.toHaveBeenCalled()
+  })
+
+  it('never lets an analytics lookup failure break the (already-completed) WS push', async () => {
+    mockPushToOrg.mockResolvedValueOnce(undefined)
+    dynamoSend.mockRejectedValueOnce(new Error('ddb down'))
+
+    await expect(handler(terminalEvent('done'), {} as never, () => undefined)).resolves.toBeUndefined()
+    expect(mockPushToOrg).toHaveBeenCalledTimes(1)
+    expect(emitServerAnalytics).not.toHaveBeenCalled()
   })
 })
