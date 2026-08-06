@@ -18,6 +18,9 @@ vi.mock('@aws-sdk/client-cognito-identity-provider', async (importOriginal) => {
   }
 })
 
+const emitServerAnalytics = vi.hoisted(() => vi.fn())
+vi.mock('../lib/analytics.js', () => ({ emitServerAnalytics }))
+
 const { handler } = await import('../handlers/auth-trigger-post-authentication.js')
 
 function baseEvent(overrides: Record<string, string> = {}): PostAuthenticationTriggerEvent {
@@ -33,7 +36,7 @@ function baseEvent(overrides: Record<string, string> = {}): PostAuthenticationTr
 }
 
 describe('auth-trigger-post-authentication handler', () => {
-  beforeEach(() => { dynamoSend.mockReset(); cognitoSend.mockReset() })
+  beforeEach(() => { dynamoSend.mockReset(); cognitoSend.mockReset(); emitServerAnalytics.mockReset() })
 
   it('ignores non-matching trigger sources', async () => {
     const event = { ...baseEvent(), triggerSource: 'PostAuthentication_Authentication_FooBar' } as PostAuthenticationTriggerEvent
@@ -44,6 +47,7 @@ describe('auth-trigger-post-authentication handler', () => {
   it('resolves the canonical accountId via the identities table before the email fallback', async () => {
     dynamoSend
       .mockResolvedValueOnce({ Item: { sub: 'ext-sub', accountId: 'account-1' } }) // Get identities table -> hit
+      .mockResolvedValueOnce({ Item: { userId: 'account-1', orgId: 'org-1' } }) // Get user (login_completed orgId lookup)
       .mockResolvedValueOnce({}) // Put method
     cognitoSend
       .mockResolvedValueOnce({ Users: [] }) // ListUsers by email — no native user for this email
@@ -51,11 +55,12 @@ describe('auth-trigger-post-authentication handler', () => {
 
     await handler(baseEvent({ identities: '[{"providerName":"Google","userId":"g1"}]' }), {} as never, () => undefined)
 
-    // Identities table hit — no email Query for resolution, no linkIdentity write. No native
-    // user exists to link against, so no AdminLinkProviderForUser call either.
-    expect(dynamoSend).toHaveBeenCalledTimes(2)
+    // Identities table hit — no email Query for resolution, no linkIdentity write. One extra Get
+    // for the login_completed orgId lookup. No native user exists to link against, so no
+    // AdminLinkProviderForUser call either.
+    expect(dynamoSend).toHaveBeenCalledTimes(3)
     expect(cognitoSend).toHaveBeenCalledTimes(2)
-    const methodPut = dynamoSend.mock.calls[1]?.[0] as { input: { Item: Record<string, unknown> } }
+    const methodPut = dynamoSend.mock.calls[2]?.[0] as { input: { Item: Record<string, unknown> } }
     expect(methodPut.input.Item['pk']).toBe('USER#account-1')
   })
 
@@ -63,6 +68,7 @@ describe('auth-trigger-post-authentication handler', () => {
     dynamoSend
       .mockResolvedValueOnce({ Item: undefined }) // Get identities table -> no mapping
       .mockResolvedValueOnce({ Items: [{ userId: 'native-sub' }] }) // Query by-email -> canonical account
+      .mockResolvedValueOnce({ Item: { userId: 'native-sub', orgId: 'org-1' } }) // Get user (login_completed orgId lookup)
       .mockResolvedValueOnce({}) // Put method
       .mockResolvedValueOnce({}) // Put audit (AUTO_LINK_POST_AUTH)
     cognitoSend
@@ -72,8 +78,9 @@ describe('auth-trigger-post-authentication handler', () => {
 
     await handler(baseEvent({ identities: '[{"providerName":"Google","userId":"g1"}]' }), {} as never, () => undefined)
 
-    // resolvedAccountId was found via email (truthy) so no linkIdentity Put — only method + audit.
-    expect(dynamoSend).toHaveBeenCalledTimes(4)
+    // resolvedAccountId was found via email (truthy) so no linkIdentity Put — Get user (orgId) +
+    // method + audit.
+    expect(dynamoSend).toHaveBeenCalledTimes(5)
     expect(cognitoSend).toHaveBeenCalledTimes(3)
     const linkCall = cognitoSend.mock.calls[2]?.[0] as { input: { SourceUser: { ProviderAttributeValue: string } } }
     expect(linkCall.input.SourceUser.ProviderAttributeValue).toBe('g1')
@@ -104,6 +111,7 @@ describe('auth-trigger-post-authentication handler', () => {
     dynamoSend
       .mockResolvedValueOnce({ Item: undefined }) // Get identities table -> no mapping
       .mockResolvedValueOnce({ Items: [{ userId: 'native-sub' }] }) // Query by-email -> canonical account
+      .mockResolvedValueOnce({ Item: { userId: 'native-sub', orgId: 'org-1' } }) // Get user (login_completed orgId lookup)
       .mockResolvedValueOnce({}) // Put method
     cognitoSend
       .mockResolvedValueOnce({ Users: [{ Username: 'a@b.com', UserStatus: 'CONFIRMED', Attributes: [{ Name: 'sub', Value: 'native-sub' }] }] })
@@ -111,6 +119,56 @@ describe('auth-trigger-post-authentication handler', () => {
       .mockRejectedValueOnce(Object.assign(new Error('already linked'), { name: 'InvalidParameterException' }))
 
     await expect(handler(baseEvent({ identities: '[{"providerName":"Google","userId":"g1"}]' }), {} as never, () => undefined)).resolves.toBeDefined()
-    expect(dynamoSend).toHaveBeenCalledTimes(3) // no audit put after the swallowed link failure
+    expect(dynamoSend).toHaveBeenCalledTimes(4) // Get user (orgId) + method; no audit after the swallowed link failure
+  })
+
+  it('emits login_completed {method} keyed to the resolved account+org for a federated sign-in', async () => {
+    dynamoSend
+      .mockResolvedValueOnce({ Item: { sub: 'ext-sub', accountId: 'account-1' } }) // Get identities table -> hit
+      .mockResolvedValueOnce({ Item: { userId: 'account-1', orgId: 'org-9' } }) // Get user (orgId lookup)
+      .mockResolvedValueOnce({}) // Put method
+    cognitoSend
+      .mockResolvedValueOnce({ Users: [] })
+      .mockResolvedValueOnce({ Users: [{ Username: 'Google_g1', UserStatus: 'EXTERNAL_PROVIDER', Attributes: [{ Name: 'identities', Value: '[{"providerName":"Google","userId":"g1"}]' }] }] })
+
+    await handler(baseEvent({ identities: '[{"providerName":"Google","userId":"g1"}]' }), {} as never, () => undefined)
+
+    expect(emitServerAnalytics).toHaveBeenCalledWith({
+      identity: { userId: 'account-1', orgId: 'org-9' },
+      type: 'login_completed',
+      payload: { method: 'google' },
+    })
+  })
+
+  it('emits login_completed {method:password} for a native (non-federated) sign-in', async () => {
+    dynamoSend
+      .mockResolvedValueOnce({ Item: { sub: 'native-sub', accountId: 'account-1' } }) // Get identities -> hit
+      .mockResolvedValueOnce({ Item: { userId: 'account-1', orgId: 'org-1' } }) // Get user (orgId lookup)
+    cognitoSend
+      .mockResolvedValueOnce({ Users: [{ Username: 'a@b.com', UserStatus: 'CONFIRMED', Attributes: [{ Name: 'sub', Value: 'native-sub' }] }] }) // ListUsers by email
+      .mockResolvedValueOnce({ Users: [{ Username: 'a@b.com', UserStatus: 'CONFIRMED', Attributes: [{ Name: 'sub', Value: 'native-sub' }] }] }) // ListUsers by sub -> not external
+
+    await handler(baseEvent({ sub: 'native-sub' }), {} as never, () => undefined)
+
+    expect(emitServerAnalytics).toHaveBeenCalledWith({
+      identity: { userId: 'account-1', orgId: 'org-1' },
+      type: 'login_completed',
+      payload: { method: 'password' },
+    })
+  })
+
+  it('skips login_completed on a first login when the user row does not exist yet (covered by user_provisioned)', async () => {
+    dynamoSend
+      .mockResolvedValueOnce({ Item: undefined }) // Get identities -> no mapping
+      .mockResolvedValueOnce({ Items: [] }) // Query by-email -> no row yet
+      .mockResolvedValueOnce({}) // Put linkIdentity (pins the sub)
+      .mockResolvedValueOnce({ Item: undefined }) // Get user (orgId lookup) -> row not written yet
+    cognitoSend
+      .mockResolvedValueOnce({ Users: [{ Username: 'a@b.com', UserStatus: 'CONFIRMED', Attributes: [{ Name: 'sub', Value: 'native-sub' }] }] }) // ListUsers by email
+      .mockResolvedValueOnce({ Users: [{ Username: 'a@b.com', UserStatus: 'CONFIRMED', Attributes: [{ Name: 'sub', Value: 'native-sub' }] }] }) // ListUsers by sub -> not external
+
+    await handler(baseEvent({ sub: 'native-sub' }), {} as never, () => undefined)
+
+    expect(emitServerAnalytics).not.toHaveBeenCalled()
   })
 })

@@ -5,6 +5,7 @@ import { dynamo } from '../lib/dynamo.js'
 import { resolveAccountIdBySub, resolveAccountIdByEmail, linkIdentity } from '../lib/accountIdentity.js'
 import { ensureOrgRbacSeeded, ensureUserRoleAssignment, resolveEffectivePermissions, type RbacTables } from '../lib/rbac.js'
 import { createLogger, type OrgRole } from '@heediq/shared'
+import { emitServerAnalytics } from '../lib/analytics.js'
 
 // Separate Lambda entry point (own env vars, not the full API config) — this fires on every
 // Cognito token issuance (D-077) and must stay minimal and fast (5s trigger timeout).
@@ -174,6 +175,17 @@ export const handler: PreTokenGenerationTriggerHandler = async (event) => {
   ])
 
   logger.info('New org provisioned at first login', { sub, accountId: newAccountId, orgId, federated: isFederatedLogin(event) })
+
+  // Server-side `user_provisioned` (D-154): the authoritative signup outcome, emitted once at the
+  // moment a brand-new org+account is minted. tier='free' mirrors the org `plan:'free'` seeded
+  // above. Fail-safe by construction (emitServerAnalytics never throws and is latency-bounded), so
+  // it can't jeopardise this login-critical 5s trigger; insertId is deterministic on userId.
+  await emitServerAnalytics({
+    identity: { userId: newAccountId, orgId },
+    type: 'user_provisioned',
+    payload: { tier: 'free' },
+  })
+
   event.response = {
     claimsOverrideDetails: {
       claimsToAddOrOverride: {
