@@ -154,9 +154,72 @@ jobs:
       - name: Deploy classification-pusher Lambda
         run: aws lambda update-function-code --function-name ${{ env.WS_CLASSIFICATION_PUSHER_FUNCTION_NAME }} --zip-file fileb://classification-pusher.zip
 
+  # D-156 promote-to-staging gate. A push to `main` is the develop→main promotion, so `main` HEAD ==
+  # what already runs on the dev stack. We therefore prove the FULL real backend (real Cognito auth,
+  # real REST + WebSocket, real summarization/chat workers, real data create+teardown) against the
+  # live DEV stack before letting the promotion reach staging/prod. This runs ONLY on `main` — never
+  # per-PR, never on the dev deploy (D-156). The GPU audio path (`e2e:audio`) stays opt-in and is not
+  # part of this gate. Needs a seeded, CONFIRMED dev test user with a permanent password + a Cognito
+  # app client with USER_PASSWORD_AUTH enabled (see tests/e2e/README.md).
+  e2e:
+    name: E2E gate (full real-backend → dev stack)
+    needs: build
+    if: github.ref_name == 'main'
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@heediq'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Deploy role in the dev workload account — used here only to read the stack's SSM config.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_DEV }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Read E2E targets from SSM (dev account)
+        id: ssm
+        run: |
+          echo "api_base=$(aws ssm get-parameter --name /heediq/api/endpoint-url --query Parameter.Value --output text)" >> "$GITHUB_OUTPUT"
+          echo "ws_url=$(aws ssm get-parameter --name /heediq/api/ws-endpoint-url --query Parameter.Value --output text)" >> "$GITHUB_OUTPUT"
+          echo "cognito_client_id=$(aws ssm get-parameter --name /heediq/api/cognito-client-id --query Parameter.Value --output text)" >> "$GITHUB_OUTPUT"
+
+      # The suite provisions its own Cognito ID token via USER_PASSWORD_AUTH (no AWS creds needed for
+      # that leg) from the seeded dev test user, then drives the real capture→classify→review→file→chat
+      # loop end to end and tears its data down. A non-zero exit blocks deploy-staging (and thus prod).
+      - name: Run full real-backend E2E (D-156)
+        run: pnpm run e2e
+        env:
+          API_BASE: ${{ steps.ssm.outputs.api_base }}
+          WS_URL: ${{ steps.ssm.outputs.ws_url }}
+          COGNITO_CLIENT_ID: ${{ steps.ssm.outputs.cognito_client_id }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          TEST_USER_EMAIL: ${{ secrets.E2E_TEST_USER_EMAIL }}
+          TEST_USER_PASSWORD: ${{ secrets.E2E_TEST_USER_PASSWORD }}
+
   deploy-staging:
     name: Deploy → staging
-    needs: build
+    needs: [build, e2e]
     if: github.ref_name == 'main'
     runs-on: ubuntu-latest
     environment: staging
