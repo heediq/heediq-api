@@ -279,12 +279,8 @@ sources.post('/:id/jobs', async (c) => {
   await sqs.send(new SendMessageCommand({
     QueueUrl: config.sqs.transcriptionQueueUrl,
     MessageBody: JSON.stringify(message),
-    // EventBridge Pipes (heediq-infra TranscriptionStack) routes free/paid tasks by filtering
-    // on this attribute — without it, neither pipe's filterCriteria matches and the job is
-    // never picked up.
-    MessageAttributes: {
-      tier: { DataType: 'String', StringValue: tier },
-    },
+    // No `tier` message attribute — the dispatcher Lambda routes free/paid by reading `tier` from
+    // the message body (D-157, replaces the tier-filtered EventBridge Pipes).
   }))
 
   logger.info('Transcription job enqueued', {
@@ -362,9 +358,8 @@ sources.post('/:id/text', requirePermission('sources:create'), async (c) => {
     await sqs.send(new SendMessageCommand({
       QueueUrl: config.sqs.summarizationQueueUrl,
       MessageBody: JSON.stringify(message),
-      MessageAttributes: {
-        tier: { DataType: 'String', StringValue: tier },
-      },
+      // No `tier` message attribute — the summarization worker reads `tier` from the body. No
+      // queue consumer routes on message attributes anymore (D-157).
     }))
   } catch (err) {
     // Enqueue failed after the transcript was committed — mark the source `failed` so it never sits

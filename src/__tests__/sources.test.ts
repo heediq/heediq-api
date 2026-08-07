@@ -279,7 +279,7 @@ describe('POST /:id/jobs — D-060 access control', () => {
     expect(res.status).toBe(201)
   })
 
-  it('sets the tier SQS message attribute — required for the EventBridge Pipe filter to route the job', async () => {
+  it('puts tier in the message body (dispatcher routes on it, D-157) — no SQS message attribute', async () => {
     mockDynamoSend
       .mockResolvedValueOnce({ Item: { sourceId: uuid, orgId: orgId, audioS3Key: 'key' } })
       .mockResolvedValueOnce({ Item: { orgId: orgId, plan: 'free' } })
@@ -292,11 +292,11 @@ describe('POST /:id/jobs — D-060 access control', () => {
       body: JSON.stringify({ sourceId: uuid, model: 'small' }),
     })
 
-    expect(mockSqsSend).toHaveBeenCalledWith(
-      expect.objectContaining({
-        MessageAttributes: { tier: { DataType: 'String', StringValue: 'free' } },
-      }),
-    )
+    // D-157: tier travels in the message body (the dispatcher Lambda routes on it) — no tier
+    // SQS message attribute.
+    const call = mockSqsSend.mock.calls[0][0]
+    expect(call.MessageAttributes).toBeUndefined()
+    expect(JSON.parse(call.MessageBody)).toMatchObject({ tier: 'free' })
   })
 
   it('rejects large-v3 for free tier (D-060)', async () => {
@@ -730,11 +730,12 @@ describe('POST /:id/text — text-file ingest (D-150 / D-065)', () => {
     )
 
     // Enqueued to the summarization queue with sourceType='text' and contentRef=sourceId (the
-    // worker reads the transcript off the source row — D-065), plus the tier message attribute.
+    // worker reads the transcript off the source row — D-065). Tier travels in the body, not a
+    // message attribute (D-157).
     expect(mockSqsSend).toHaveBeenCalledOnce()
     const call = mockSqsSend.mock.calls[0][0]
     expect(call.QueueUrl).toBe('https://sqs/summarization')
-    expect(call.MessageAttributes).toEqual({ tier: { DataType: 'String', StringValue: 'free' } })
+    expect(call.MessageAttributes).toBeUndefined()
     const message = JSON.parse(call.MessageBody)
     expect(message).toMatchObject({ sourceType: 'text', contentRef: uuid, sourceId: uuid, orgId, tier: 'free' })
   })
@@ -753,7 +754,7 @@ describe('POST /:id/text — text-file ingest (D-150 / D-065)', () => {
     })
     const message = JSON.parse(mockSqsSend.mock.calls[0][0].MessageBody)
     expect(message.tier).toBe('paid')
-    expect(mockSqsSend.mock.calls[0][0].MessageAttributes.tier.StringValue).toBe('paid')
+    expect(mockSqsSend.mock.calls[0][0].MessageAttributes).toBeUndefined()
   })
 
   it('returns 404 when the transcript write loses a create→delete race (conditional check fails)', async () => {
