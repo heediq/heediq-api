@@ -148,7 +148,7 @@ async function main() {
   // 3. PUT the bytes straight to S3. Content-Type + Content-Length must match what was signed.
   log('PUT audio -> S3')
   const put = await fetch(uploadUrl, { method: 'PUT', headers: { 'Content-Type': 'audio/wav' }, body: wav })
-  if (!put.ok) fail(ws, sourceId, `S3 PUT failed -> ${put.status}: ${await put.text()}`)
+  if (!put.ok) await fail(ws, sourceId, `S3 PUT failed -> ${put.status}: ${await put.text()}`)
 
   // 4. Enqueue transcription (free-tier `small` model — no D-060 paid gating).
   log('POST /sources/:id/jobs (small)')
@@ -186,19 +186,19 @@ async function waitForTranscription(sourceId, jobId, frames, ws) {
       (f) => f.type === 'job_status' && f.payload.jobId === jobId && ['done', 'failed'].includes(f.payload.status),
     )
     if (jf) {
-      if (jf.payload.status === 'failed') fail(ws, sourceId, `transcription job reported status=failed`)
+      if (jf.payload.status === 'failed') await fail(ws, sourceId, `transcription job reported status=failed`)
       return { via: 'ws', status: jf.payload.status }
     }
     try {
       const src = (await api('GET', `/api/v1/sources/${sourceId}`)).source ?? {}
-      if (src.status === 'failed') fail(ws, sourceId, `source flipped to status=failed during transcription`)
+      if (src.status === 'failed') await fail(ws, sourceId, `source flipped to status=failed during transcription`)
       if (src.status === 'ready') return { via: 'poll', status: 'done' }
     } catch {
       /* transient; keep polling */
     }
     await sleep(POLL_MS)
   }
-  fail(ws, sourceId, `transcription did not reach a terminal state within ${TRANSCRIBE_TIMEOUT_MS / 1000}s`)
+  await fail(ws, sourceId, `transcription did not reach a terminal state within ${TRANSCRIBE_TIMEOUT_MS / 1000}s`)
 }
 
 async function cleanup(sourceId) {
@@ -211,15 +211,17 @@ async function cleanup(sourceId) {
   }
 }
 
-function fail(ws, sourceId, message) {
+// Await cleanup, then exit — MUST be awaited by callers so no code runs past the failure (an
+// unawaited exit lets the caller fall through, e.g. into `terminal.via` on undefined).
+async function fail(ws, sourceId, message) {
   log('❌ FAIL:', message)
   try {
     ws.close()
   } catch {
     /* ignore */
   }
-  // Fire-and-forget cleanup on the way out — don't leave the failed run's Source behind.
-  cleanup(sourceId).finally(() => process.exit(1))
+  await cleanup(sourceId)
+  process.exit(1)
 }
 
 main().catch((e) => {
